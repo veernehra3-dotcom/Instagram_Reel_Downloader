@@ -1,7 +1,9 @@
 
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, Response
 import yt_dlp
 import re
+import requests
+from urllib.parse import urlparse
 
 app = Flask(__name__)
 
@@ -11,29 +13,28 @@ HTML = """
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tech by Nehra | Instagram Downloader</title>
+<title>Tech by Nehra Downloader</title>
 <style>
 *{box-sizing:border-box}
-body{margin:0;background:#10111b;color:white;font-family:Arial,sans-serif;padding:22px}
-.container{max-width:650px;margin:35px auto;background:#1c1d2c;padding:25px;border-radius:20px}
+body{margin:0;background:#10111b;color:#fff;font-family:Arial;padding:20px}
+.container{max-width:650px;margin:30px auto;background:#1c1d2c;padding:24px;border-radius:20px}
 h1{text-align:center;color:#ff729e}
-p{text-align:center;color:#c7c7d8}
-.categories{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:25px 0}
-.cat{background:#292a3d;border:1px solid #44465e;border-radius:12px;padding:13px 3px;text-align:center;cursor:pointer;font-size:12px}
+p{text-align:center;color:#ccc}
+.categories{display:grid;grid-template-columns:repeat(5,1fr);gap:7px;margin:25px 0}
+.cat{padding:12px 3px;text-align:center;background:#292a3d;border:1px solid #45465b;border-radius:12px;cursor:pointer;font-size:12px}
 .cat.active{border-color:#ff729e;background:#48283d}
-.emoji{display:block;font-size:24px;margin-bottom:8px}
-input,select,button{width:100%;padding:15px;margin-top:12px;border-radius:10px;border:1px solid #45465b;font-size:15px}
-input,select{background:#10111b;color:white}
-button{background:#ff397b;color:white;font-weight:bold;border:0;cursor:pointer}
-#status{overflow-wrap:anywhere;margin-top:18px;line-height:1.6}
-a{color:#70e5b1}
-.small{font-size:12px;color:#aaa;text-align:center}
+.emoji{display:block;font-size:23px;margin-bottom:7px}
+input,select,button{width:100%;padding:15px;margin-top:12px;border-radius:10px;font-size:15px}
+input,select{background:#10111b;color:white;border:1px solid #45465b}
+button{background:#ff397b;color:white;border:0;font-weight:bold;cursor:pointer}
+#status{margin-top:18px;text-align:center;overflow-wrap:anywhere;line-height:1.7}
+.small{font-size:12px;color:#aaa}
 </style>
 </head>
 <body>
 <div class="container">
 <h1>Tech by Nehra</h1>
-<p>Instagram Downloader</p>
+<p>Instagram Video Downloader</p>
 <div class="categories">
 <div class="cat active" data-type="reel"><span class="emoji">🎬</span>Reels</div>
 <div class="cat" data-type="post"><span class="emoji">🖼️</span>Posts</div>
@@ -42,31 +43,33 @@ a{color:#70e5b1}
 <div class="cat" data-type="video"><span class="emoji">📹</span>Videos</div>
 </div>
 <form id="form">
-<input type="hidden" id="type" name="type" value="reel">
-<input type="url" id="url" name="url" placeholder="Paste public Instagram link here" required>
-<select id="quality" name="quality">
+<input type="hidden" id="type" value="reel">
+<input id="url" type="url" placeholder="Paste public Instagram link here" required>
+<select id="quality">
 <option value="best">Highest Available Quality</option>
 <option value="1080">1080p</option>
 <option value="720">720p</option>
 <option value="480">480p</option>
 </select>
-<button type="submit">Get Download Link</button>
+<button id="submit" type="submit">Get Download Link</button>
 </form>
 <div id="status"></div>
-<p class="small">Use only public content you have permission to download.</p>
+<p class="small">Download only content you own or have permission to save.</p>
 </div>
 <script>
 document.querySelectorAll('.cat').forEach(el=>{
-el.addEventListener('click',()=>{
+el.onclick=()=>{
 document.querySelectorAll('.cat').forEach(x=>x.classList.remove('active'));
 el.classList.add('active');
 document.getElementById('type').value=el.dataset.type;
+};
 });
-});
-document.getElementById('form').addEventListener('submit',async e=>{
+document.getElementById('form').onsubmit=async e=>{
 e.preventDefault();
 const status=document.getElementById('status');
-status.textContent='Processing link...';
+const btn=document.getElementById('submit');
+btn.disabled=true;
+status.textContent='Processing... Please wait.';
 try{
 const r=await fetch('/download',{
 method:'POST',
@@ -78,20 +81,21 @@ type:document.getElementById('type').value
 })
 });
 const d=await r.json();
-if(!r.ok)throw new Error(d.error||'Download failed');
-status.innerHTML='';
-(d.formats||[]).forEach(f=>{
+if(!r.ok)throw Error(d.error||'Download failed');
+status.replaceChildren();
+if(!d.token)throw Error('No downloadable video found.');
 const a=document.createElement('a');
-a.href=f.url;
-a.textContent='Download '+f.quality;
-a.target='_blank';
-a.rel='noopener noreferrer';
+a.href='/file/'+encodeURIComponent(d.token);
+a.textContent='⬇ Download Video ('+d.quality+')';
+a.style.cssText='display:block;background:#20a875;color:white;padding:15px;border-radius:10px;text-decoration:none;font-weight:bold;margin-top:12px';
 status.appendChild(a);
-status.appendChild(document.createElement('br'));
-});
-if(d.formats&&d.formats.length===0)status.textContent='No downloadable formats found.';
-}catch(err){status.textContent=err.message}
-});
+a.click();
+}catch(err){
+status.textContent=err.message;
+}finally{
+btn.disabled=false;
+}
+};
 </script>
 </body>
 </html>
@@ -111,54 +115,73 @@ def download():
     url = (data.get("url") or "").strip()
     quality = data.get("quality", "best")
 
-    if not re.match(r"^https?://(www\.)?instagram\.com/", url):
-        return jsonify({"error": "Please enter a valid Instagram URL."}), 400
-
-    if quality not in ("best", "1080", "720", "480"):
-        quality = "best"
-
-    if quality == "best":
-        fmt = "best"
-    else:
-        fmt = f"best[height<={quality}]"
-
     try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or parsed.hostname not in ("instagram.com", "www.instagram.com"):
+            return jsonify({"error": "Please enter a valid Instagram URL."}), 400
+
+        if quality not in ("best", "1080", "720", "480"):
+            quality = "best"
+
+        fmt = "best[ext=mp4]/best" if quality == "best" else f"best[height<={quality}][ext=mp4]/best[height<={quality}]/best"
+
         opts = {
             "format": fmt,
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
-            "skip_download": True,
-            "socket_timeout": 20,
+            "socket_timeout": 25,
         }
+
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-        formats = []
-        if info.get("url"):
-            formats.append({
-                "quality": str(info.get("height") or "Available"),
-                "url": info["url"]
-            })
-        else:
-            for f in info.get("formats", []):
-                if f.get("url") and f.get("vcodec") != "none":
-                    height = f.get("height") or 0
-                    if quality == "best" or height <= int(quality):
-                        formats.append({
-                            "quality": f"{height}p" if height else "Available",
-                            "url": f["url"]
-                        })
+        video_url = info.get("url")
+        if not video_url:
+            formats = [f for f in info.get("formats", []) if f.get("url") and f.get("vcodec") != "none"]
+            if not formats:
+                return jsonify({"error": "No downloadable video found."}), 400
+            formats.sort(key=lambda f: f.get("height") or 0, reverse=True)
+            video_url = formats[0]["url"]
 
-        unique = {}
-        for f in formats:
-            unique[f["quality"]] = f
-        return jsonify({"formats": list(unique.values())})
+        token = str(abs(hash(video_url)))
+        app.config.setdefault("DOWNLOADS", {})[token] = {
+            "url": video_url,
+            "quality": info.get("height") or quality
+        }
+
+        return jsonify({"token": token, "quality": str(info.get("height") or quality) + "p"})
 
     except Exception:
-        return jsonify({
-            "error": "Could not access this content. It may be private, restricted, or unsupported. Please try a public Instagram link."
-        }), 400
+        return jsonify({"error": "Could not access this video. Check that it is public and try again."}), 400
+
+@app.route("/file/<token>")
+def get_file(token):
+    item = app.config.get("DOWNLOADS", {}).get(token)
+    if not item:
+        return "Download link expired. Please try again.", 404
+
+    try:
+        response = requests.get(
+            item["url"],
+            headers={"User-Agent": "Mozilla/5.0"},
+            stream=True,
+            timeout=30
+        )
+        response.raise_for_status()
+
+        def generate():
+            for chunk in response.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    yield chunk
+
+        return Response(
+            generate(),
+            content_type="video/mp4",
+            headers={"Content-Disposition": 'attachment; filename="Tech_by_Nehra.mp4"'}
+        )
+    except Exception:
+        return "Could not download the video. Please try again.", 502
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
