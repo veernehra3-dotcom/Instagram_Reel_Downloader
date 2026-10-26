@@ -5,90 +5,106 @@ import uuid
 import shutil
 import tempfile
 import threading
+import subprocess
+from urllib.parse import urlparse
 
 import yt_dlp
-
 from flask import Flask, request, jsonify, Response, send_file
-from urllib.parse import urlparse
 
 app = Flask(__name__)
 
-# Blogger website URL
 ALLOWED_ORIGIN = "https://techbynehra22.blogspot.com"
-
-# Temporary download storage
 DOWNLOADS = {}
 DOWNLOADS_LOCK = threading.Lock()
 
 
-# CORS settings for Blogger
 @app.after_request
 def add_cors_headers(response):
     origin = request.headers.get("Origin")
-
     if origin == ALLOWED_ORIGIN:
         response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type"
         response.headers["Access-Control-Max-Age"] = "86400"
         response.headers["Vary"] = "Origin"
-
     return response
 
 
-# Check Instagram URL
 def is_valid_instagram_url(url):
     try:
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
-
         return (
             parsed.scheme in ("http", "https")
-            and host in (
+            and host in {
                 "instagram.com",
                 "www.instagram.com",
-                "m.instagram.com"
+                "m.instagram.com",
+            }
+            and parsed.path.startswith(
+                ("/reel/", "/reels/", "/p/", "/tv/")
             )
         )
     except Exception:
         return False
 
 
-# Home page
-@app.route("/", methods=["GET"])
+def has_audio_stream(path):
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe or not os.path.isfile(path):
+        return False
+
+    try:
+        result = subprocess.run(
+            [
+                ffprobe, "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=codec_type",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        return (
+            result.returncode == 0
+            and "audio" in result.stdout.lower()
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+@app.route("/")
 def home():
     return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Instagram Reel Downloader API</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-    </head>
-    <body style="font-family:Arial;text-align:center;padding:40px">
-        <h2>Instagram Reel Downloader API</h2>
-        <p>Service is running.</p>
-        <p><a href="/health">Check API Health</a></p>
-    </body>
-    </html>
+    <html><head>
+    <title>Instagram Reel Downloader API</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    </head><body style="font-family:Arial;text-align:center;padding:40px">
+    <h2>Instagram Reel Downloader API</h2>
+    <p>Service is running.</p>
+    <a href="/health">Check API Health</a>
+    </body></html>
     """
 
 
-# Health check
-@app.route("/health", methods=["GET"])
+@app.route("/health")
 def health():
     return jsonify({
         "status": "online",
-        "message": "Instagram Downloader API is running"
+        "message": "Instagram Downloader API is running",
+        "ffmpeg_available": bool(shutil.which("ffmpeg")),
+        "ffprobe_available": bool(shutil.which("ffprobe")),
     })
 
 
-# Handle browser preflight requests
 @app.route("/download", methods=["OPTIONS"])
 def download_options():
     return Response("", status=204)
 
 
-# Download video AND audio, merging when required
 @app.route("/download", methods=["POST"])
 def download():
     data = request.get_json(silent=True) or {}
@@ -103,69 +119,77 @@ def download():
     if not is_valid_instagram_url(url):
         return jsonify({
             "success": False,
-            "error": "Please enter a valid Instagram URL."
+            "error": "Please enter a valid Instagram Reel or post URL."
         }), 400
 
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        return jsonify({
+            "success": False,
+            "error": "FFmpeg is unavailable on the server. Check apt.txt and redeploy."
+        }), 503
+
     temp_dir = tempfile.mkdtemp(prefix="instagram_download_")
+    output_template = os.path.join(temp_dir, "%(id)s.%(ext)s")
 
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-
-        # Prefer video + audio; fall back to a combined stream
-        "format": "bestvideo*+bestaudio/best",
-
-        # Merge separate streams into an MP4 when needed
+        "format": "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
-
-        "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
-
+        "outtmpl": output_template,
+        "ffmpeg_location": shutil.which("ffmpeg"),
         "extractor_args": {
-            "instagram": {
-                "api": ["web"]
-            }
+            "instagram": {"api": ["web"]}
         },
+        "retries": 2,
+        "fragment_retries": 2,
+        "socket_timeout": 25,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
 
-            if not info:
-                raise RuntimeError("Video information could not be retrieved.")
+        if not info:
+            raise RuntimeError("No video information returned.")
 
-            prepared_path = ydl.prepare_filename(info)
+        candidates = [
+            os.path.join(temp_dir, name)
+            for name in os.listdir(temp_dir)
+            if os.path.isfile(os.path.join(temp_dir, name))
+            and not name.endswith((".part", ".ytdl", ".json"))
+        ]
 
-        # FFmpeg normally creates this MP4 when merging streams
-        mp4_path = os.path.splitext(prepared_path)[0] + ".mp4"
+        if not candidates:
+            raise RuntimeError("Downloaded output file was not found.")
 
-        if os.path.isfile(mp4_path):
-            final_path = mp4_path
-        elif os.path.isfile(prepared_path):
-            final_path = prepared_path
-        else:
-            # Find the actual downloaded output if its extension changed
-            candidates = [
-                os.path.join(temp_dir, name)
-                for name in os.listdir(temp_dir)
-                if os.path.isfile(os.path.join(temp_dir, name))
-                and not name.endswith((".part", ".ytdl"))
-            ]
+        mp4_files = [
+            path for path in candidates
+            if path.lower().endswith(".mp4")
+        ]
+        final_path = max(
+            mp4_files or candidates,
+            key=os.path.getsize
+        )
 
-            if not candidates:
-                raise RuntimeError("The downloaded video file was not found.")
+        if os.path.getsize(final_path) == 0:
+            raise RuntimeError("Downloaded file is empty.")
 
-            final_path = candidates[0]
+        # If the selected file has no audio, do not report success.
+        if not has_audio_stream(final_path):
+            raise RuntimeError(
+                "The selected Instagram stream contains no audio track."
+            )
 
         token = uuid.uuid4().hex
-        title = info.get("title") or "instagram_video"
+        title = info.get("title") or "instagram_reel"
 
         with DOWNLOADS_LOCK:
             DOWNLOADS[token] = {
                 "path": final_path,
                 "temp_dir": temp_dir,
-                "title": title
+                "title": title,
             }
 
         return jsonify({
@@ -173,24 +197,31 @@ def download():
             "token": token,
             "title": title,
             "quality": "best",
-            "audio_included": True
+            "audio_included": True,
+            "download_url": f"/file/{token}",
         })
 
-    except Exception:
-        app.logger.exception("Instagram video/audio download failed")
+    except Exception as exc:
+        app.logger.exception("Instagram download failed")
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+        if "no audio track" in str(exc).lower():
+            message = (
+                "The selected stream has no audio track. "
+                "Try another public Reel or retry later."
+            )
+        else:
+            message = (
+                "Could not download this Reel with audio. "
+                "Check the Render logs, FFmpeg, and Instagram URL."
+            )
 
         return jsonify({
             "success": False,
-            "error": (
-                "Could not download the video with audio. "
-                "Check that FFmpeg is installed on the server and "
-                "that the Instagram post is publicly accessible."
-            )
+            "error": message
         }), 502
 
 
-# Send the completed video file to the browser
 @app.route("/file/<token>", methods=["GET"])
 def get_file(token):
     with DOWNLOADS_LOCK:
@@ -202,18 +233,24 @@ def get_file(token):
             "error": "Download link expired or not found. Please try again."
         }), 404
 
-    file_path = item["path"]
+    path = item["path"]
 
-    if not os.path.isfile(file_path):
+    if not os.path.isfile(path):
         return jsonify({
             "success": False,
             "error": "The downloaded file is no longer available."
         }), 404
 
+    if not has_audio_stream(path):
+        return jsonify({
+            "success": False,
+            "error": "Audio was not detected; the file was not sent."
+        }), 502
+
     filename = re.sub(
         r"[^A-Za-z0-9._-]",
         "_",
-        item.get("title", "instagram_video")
+        item.get("title", "instagram_reel")
     )[:100]
 
     if not filename.lower().endswith(".mp4"):
@@ -221,33 +258,32 @@ def get_file(token):
 
     try:
         response = send_file(
-            file_path,
+            path,
             mimetype="video/mp4",
             as_attachment=True,
             download_name=filename,
             conditional=False,
-            max_age=0
+            max_age=0,
         )
-
         response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
 
         def cleanup():
             with DOWNLOADS_LOCK:
                 DOWNLOADS.pop(token, None)
-
             shutil.rmtree(item["temp_dir"], ignore_errors=True)
 
         response.call_on_close(cleanup)
         return response
 
     except Exception:
-        app.logger.exception("Video file delivery failed")
+        app.logger.exception("File delivery failed")
         return jsonify({
             "success": False,
-            "error": "Could not send the downloaded video. Please try again."
+            "error": "Could not send the video. Please try again."
         }), 502
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
