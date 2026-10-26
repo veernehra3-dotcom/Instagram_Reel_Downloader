@@ -94,8 +94,9 @@ def download_with_options(url, temp_dir, format_selector):
     output_template = os.path.join(temp_dir, "%(id)s.%(ext)s")
 
     ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
+        "quiet": False,
+"no_warnings": False,
+"verbose": True,
         "noplaylist": True,
         "format": format_selector,
         "merge_output_format": "mp4",
