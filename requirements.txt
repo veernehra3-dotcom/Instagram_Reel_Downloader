@@ -1,5 +1,4 @@
 
-Flask
-gunicorn
-yt-dlp
-requests
+Flask>=3.0,<4.0
+gunicorn>=22.0,<24.0
+yt-dlp>=2025.1.15
