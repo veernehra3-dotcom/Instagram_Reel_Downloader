@@ -2,11 +2,13 @@
 import os
 import re
 import uuid
+import shutil
+import tempfile
 import threading
-import requests
+
 import yt_dlp
 
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, send_file
 from urllib.parse import urlparse
 
 app = Flask(__name__)
@@ -86,7 +88,7 @@ def download_options():
     return Response("", status=204)
 
 
-# Get video URL
+# Download video AND audio, merging when required
 @app.route("/download", methods=["POST"])
 def download():
     data = request.get_json(silent=True) or {}
@@ -104,11 +106,21 @@ def download():
             "error": "Please enter a valid Instagram URL."
         }), 400
 
+    temp_dir = tempfile.mkdtemp(prefix="instagram_download_")
+
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "format": "best[ext=mp4]/best",
+
+        # Prefer video + audio; fall back to a combined stream
+        "format": "bestvideo*+bestaudio/best",
+
+        # Merge separate streams into an MP4 when needed
+        "merge_output_format": "mp4",
+
+        "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
+
         "extractor_args": {
             "instagram": {
                 "api": ["web"]
@@ -118,55 +130,67 @@ def download():
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(url, download=True)
 
-        if not info:
-            return jsonify({
-                "success": False,
-                "error": "Video information could not be retrieved."
-            }), 502
+            if not info:
+                raise RuntimeError("Video information could not be retrieved.")
 
-        video_url = info.get("url")
+            prepared_path = ydl.prepare_filename(info)
 
-        if not video_url and info.get("formats"):
-            formats = [
-                f for f in info["formats"]
-                if f.get("url") and f.get("vcodec") != "none"
+        # FFmpeg normally creates this MP4 when merging streams
+        mp4_path = os.path.splitext(prepared_path)[0] + ".mp4"
+
+        if os.path.isfile(mp4_path):
+            final_path = mp4_path
+        elif os.path.isfile(prepared_path):
+            final_path = prepared_path
+        else:
+            # Find the actual downloaded output if its extension changed
+            candidates = [
+                os.path.join(temp_dir, name)
+                for name in os.listdir(temp_dir)
+                if os.path.isfile(os.path.join(temp_dir, name))
+                and not name.endswith((".part", ".ytdl"))
             ]
-            if formats:
-                video_url = formats[-1]["url"]
 
-        if not video_url:
-            return jsonify({
-                "success": False,
-                "error": "Video URL not found. The post may be private or unsupported."
-            }), 502
+            if not candidates:
+                raise RuntimeError("The downloaded video file was not found.")
+
+            final_path = candidates[0]
 
         token = uuid.uuid4().hex
+        title = info.get("title") or "instagram_video"
 
         with DOWNLOADS_LOCK:
             DOWNLOADS[token] = {
-                "url": video_url,
-                "title": info.get("title") or "instagram_video",
-                "headers": info.get("http_headers") or {}
+                "path": final_path,
+                "temp_dir": temp_dir,
+                "title": title
             }
 
         return jsonify({
             "success": True,
             "token": token,
-            "title": info.get("title") or "instagram_video",
-            "quality": "best"
+            "title": title,
+            "quality": "best",
+            "audio_included": True
         })
 
-    except Exception as e:
-        app.logger.exception("Instagram extraction failed")
+    except Exception:
+        app.logger.exception("Instagram video/audio download failed")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
         return jsonify({
             "success": False,
-            "error": "Could not retrieve the video. It may be private, unavailable, or Instagram may have restricted access."
+            "error": (
+                "Could not download the video with audio. "
+                "Check that FFmpeg is installed on the server and "
+                "that the Instagram post is publicly accessible."
+            )
         }), 502
 
 
-# Stream video to the user's browser
+# Send the completed video file to the browser
 @app.route("/file/<token>", methods=["GET"])
 def get_file(token):
     with DOWNLOADS_LOCK:
@@ -178,59 +202,49 @@ def get_file(token):
             "error": "Download link expired or not found. Please try again."
         }), 404
 
+    file_path = item["path"]
+
+    if not os.path.isfile(file_path):
+        return jsonify({
+            "success": False,
+            "error": "The downloaded file is no longer available."
+        }), 404
+
+    filename = re.sub(
+        r"[^A-Za-z0-9._-]",
+        "_",
+        item.get("title", "instagram_video")
+    )[:100]
+
+    if not filename.lower().endswith(".mp4"):
+        filename += ".mp4"
+
     try:
-        headers = dict(item.get("headers") or {})
-        headers["User-Agent"] = headers.get(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"
+        response = send_file(
+            file_path,
+            mimetype="video/mp4",
+            as_attachment=True,
+            download_name=filename,
+            conditional=False,
+            max_age=0
         )
 
-        upstream = requests.get(
-            item["url"],
-            headers=headers,
-            stream=True,
-            timeout=(15, 60),
-            allow_redirects=True
-        )
-        upstream.raise_for_status()
+        response.headers["Cache-Control"] = "no-store"
 
-        content_type = upstream.headers.get(
-            "Content-Type", "video/mp4"
-        )
+        def cleanup():
+            with DOWNLOADS_LOCK:
+                DOWNLOADS.pop(token, None)
 
-        filename = re.sub(
-            r"[^A-Za-z0-9._-]",
-            "_",
-            item.get("title", "instagram_video")
-        )[:100]
+            shutil.rmtree(item["temp_dir"], ignore_errors=True)
 
-        if not filename.lower().endswith(".mp4"):
-            filename += ".mp4"
-
-        def generate():
-            try:
-                for chunk in upstream.iter_content(chunk_size=64 * 1024):
-                    if chunk:
-                        yield chunk
-            finally:
-                upstream.close()
-
-        response = Response(
-            generate(),
-            content_type=content_type,
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "Cache-Control": "no-store"
-            }
-        )
-
+        response.call_on_close(cleanup)
         return response
 
     except Exception:
-        app.logger.exception("Video streaming failed")
+        app.logger.exception("Video file delivery failed")
         return jsonify({
             "success": False,
-            "error": "Could not download the video file. Please try again."
+            "error": "Could not send the downloaded video. Please try again."
         }), 502
 
 
