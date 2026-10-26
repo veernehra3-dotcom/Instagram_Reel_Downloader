@@ -1,4 +1,4 @@
-
+```python
 import os
 import re
 import uuid
@@ -34,6 +34,7 @@ def is_valid_instagram_url(url):
     try:
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
+
         return (
             parsed.scheme in ("http", "https")
             and host in {
@@ -47,8 +48,9 @@ def is_valid_instagram_url(url):
         return False
 
 
-def has_audio_stream(path):
+def has_stream(path, stream_type):
     ffprobe = shutil.which("ffprobe")
+
     if not ffprobe or not os.path.isfile(path):
         return False
 
@@ -57,7 +59,7 @@ def has_audio_stream(path):
             [
                 ffprobe,
                 "-v", "error",
-                "-select_streams", "a:0",
+                "-select_streams", stream_type,
                 "-show_entries", "stream=codec_type",
                 "-of", "default=noprint_wrappers=1:nokey=1",
                 path,
@@ -67,9 +69,24 @@ def has_audio_stream(path):
             timeout=25,
             check=False,
         )
-        return result.returncode == 0 and "audio" in result.stdout.lower()
+
+        expected = "video" if stream_type.startswith("v") else "audio"
+
+        return (
+            result.returncode == 0
+            and expected in result.stdout.lower()
+        )
+
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def has_audio_stream(path):
+    return has_stream(path, "a:0")
+
+
+def has_video_stream(path):
+    return has_stream(path, "v:0")
 
 
 def get_video_files(temp_dir):
@@ -95,8 +112,8 @@ def download_with_options(url, temp_dir, format_selector):
 
     ydl_opts = {
         "quiet": False,
-"no_warnings": False,
-"verbose": True,
+        "no_warnings": False,
+        "verbose": True,
         "noplaylist": True,
         "format": format_selector,
         "merge_output_format": "mp4",
@@ -125,17 +142,27 @@ def download_with_options(url, temp_dir, format_selector):
     if not candidates:
         raise RuntimeError("Downloaded video file was not found.")
 
-    # Prefer a video file that actually contains an audio stream.
-    audio_files = [
+    # Only accept a file containing BOTH video and audio.
+    # This prevents an audio-only file from being sent as a video.
+    complete_files = [
         path for path in candidates
-        if has_audio_stream(path)
+        if has_video_stream(path) and has_audio_stream(path)
     ]
 
-    if audio_files:
-        final_path = max(audio_files, key=os.path.getsize)
+    if complete_files:
+        final_path = max(complete_files, key=os.path.getsize)
         return info, final_path
 
-    raise RuntimeError("Downloaded video has no detectable audio stream.")
+    # If separate video/audio files remain, yt-dlp/FFmpeg may not
+    # have merged them successfully. Report the real issue in logs.
+    app.logger.warning(
+        "No merged file with both video and audio was found. Files: %s",
+        [os.path.basename(p) for p in candidates],
+    )
+
+    raise RuntimeError(
+        "No downloaded file contains both video and audio streams."
+    )
 
 
 @app.route("/")
@@ -175,8 +202,14 @@ def download_options():
 def download():
     data = request.get_json(silent=True) or {}
     url = (data.get("url") or "").strip()
-app.logger.warning("DOWNLOAD REQUEST RECEIVED")
-app.logger.warning("Instagram URL received: %s", url.split("?")[0])
+
+    # Diagnostic logs: never log cookies or request headers.
+    app.logger.warning("DOWNLOAD REQUEST RECEIVED")
+    app.logger.warning(
+        "Instagram URL received: %s",
+        url.split("?")[0],
+    )
+
     if not url:
         return jsonify({
             "success": False,
@@ -197,8 +230,7 @@ app.logger.warning("Instagram URL received: %s", url.split("?")[0])
 
     temp_dir = tempfile.mkdtemp(prefix="instagram_download_")
 
-    # Try a format that prefers a video stream with audio first,
-    # then separate video + audio, then a combined/best fallback.
+    # Try alternate format selectors if the first attempt fails.
     format_options = [
         "bv*+ba/b",
         "bestvideo+bestaudio/best",
@@ -210,22 +242,27 @@ app.logger.warning("Instagram URL received: %s", url.split("?")[0])
     final_path = None
 
     try:
-        for index, format_selector in enumerate(format_options):
-            # Use a clean directory for each attempt.
+        for index, format_selector in enumerate(format_options, start=1):
+
+            # Clear files left by a previous failed attempt.
             for name in os.listdir(temp_dir):
                 path = os.path.join(temp_dir, name)
+
                 try:
                     if os.path.isfile(path) or os.path.islink(path):
                         os.remove(path)
                     elif os.path.isdir(path):
                         shutil.rmtree(path)
                 except OSError:
-                    app.logger.warning("Could not clear retry file: %s", path)
+                    app.logger.warning(
+                        "Could not clear retry file: %s",
+                        path,
+                    )
 
             try:
-                app.logger.info(
-                    "Instagram download attempt %s using format: %s",
-                    index + 1,
+                app.logger.warning(
+                    "Download attempt %s using format: %s",
+                    index,
                     format_selector,
                 )
 
@@ -235,33 +272,46 @@ app.logger.warning("Instagram URL received: %s", url.split("?")[0])
                     format_selector,
                 )
 
-                if final_path and has_audio_stream(final_path):
+                if (
+                    final_path
+                    and os.path.isfile(final_path)
+                    and has_video_stream(final_path)
+                    and has_audio_stream(final_path)
+                ):
                     break
 
                 last_error = RuntimeError(
-                    "Downloaded file has no detectable audio stream."
+                    "Final file did not contain both video and audio."
                 )
                 final_path = None
 
             except Exception as exc:
                 last_error = exc
-                app.logger.warning(
-                    "Download attempt %s failed: %s",
-                    index + 1,
-                    str(exc),
+                final_path = None
+
+                app.logger.exception(
+                    "Download attempt %s failed",
+                    index,
                 )
 
         if not final_path or not os.path.isfile(final_path):
             raise RuntimeError(
-                "All download formats failed. "
-                + (str(last_error) if last_error else "No valid output file.")
+                "All format attempts failed. "
+                + (
+                    str(last_error)
+                    if last_error
+                    else "No valid output file was produced."
+                )
             )
 
         if os.path.getsize(final_path) == 0:
             raise RuntimeError("Downloaded file is empty.")
 
+        if not has_video_stream(final_path):
+            raise RuntimeError("Downloaded file has no video stream.")
+
         if not has_audio_stream(final_path):
-            raise RuntimeError("Downloaded file has no detectable audio stream.")
+            raise RuntimeError("Downloaded file has no audio stream.")
 
         token = uuid.uuid4().hex
         title = (info or {}).get("title") or "instagram_reel"
@@ -273,6 +323,10 @@ app.logger.warning("Instagram URL received: %s", url.split("?")[0])
                 "title": title,
             }
 
+        app.logger.warning(
+            "Download successful; video and audio streams verified."
+        )
+
         return jsonify({
             "success": True,
             "token": token,
@@ -282,29 +336,18 @@ app.logger.warning("Instagram URL received: %s", url.split("?")[0])
             "download_url": f"/file/{token}",
         })
 
-    except Exception as exc:
+    except Exception:
         app.logger.exception("Instagram download failed")
 
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-        error_text = str(exc).lower()
-
-        if "no audio" in error_text or "audio stream" in error_text:
-            message = (
-                "Audio could not be found in the available Instagram streams. "
-                "This Reel may not expose an audio stream to the downloader. "
-                "Try another public Reel or retry later."
-            )
-        else:
-            message = (
-                "Could not download this Reel. Instagram may have restricted "
-                "access, or the available formats may have changed. "
-                "Please retry with another public Reel."
-            )
-
         return jsonify({
             "success": False,
-            "error": message,
+            "error": (
+                "Could not download this Reel with audio. "
+                "Check the latest Render logs for the actual format or "
+                "FFmpeg error, then try again."
+            ),
         }), 502
 
 
@@ -327,10 +370,10 @@ def get_file(token):
             "error": "The downloaded file is no longer available.",
         }), 404
 
-    if not has_audio_stream(path):
+    if not has_video_stream(path) or not has_audio_stream(path):
         return jsonify({
             "success": False,
-            "error": "Audio was not detected; the file was not sent.",
+            "error": "The video or audio stream is missing; the file was not sent.",
         }), 502
 
     filename = re.sub(
@@ -358,6 +401,7 @@ def get_file(token):
         def cleanup():
             with DOWNLOADS_LOCK:
                 DOWNLOADS.pop(token, None)
+
             shutil.rmtree(item["temp_dir"], ignore_errors=True)
 
         response.call_on_close(cleanup)
@@ -365,6 +409,7 @@ def get_file(token):
 
     except Exception:
         app.logger.exception("File delivery failed")
+
         return jsonify({
             "success": False,
             "error": "Could not send the video. Please try again.",
@@ -374,3 +419,4 @@ def get_file(token):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+```
