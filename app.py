@@ -175,7 +175,8 @@ def download_options():
 def download():
     data = request.get_json(silent=True) or {}
     url = (data.get("url") or "").strip()
-
+app.logger.warning("DOWNLOAD REQUEST RECEIVED")
+app.logger.warning("Instagram URL received: %s", url.split("?")[0])
     if not url:
         return jsonify({
             "success": False,
