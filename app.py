@@ -18,9 +18,9 @@ DOWNLOADS = {}
 DOWNLOADS_LOCK = threading.Lock()
 
 
-# --------------------------------------------------
+# =========================================================
 # CORS
-# --------------------------------------------------
+# =========================================================
 
 @app.after_request
 def add_cors_headers(response):
@@ -36,9 +36,9 @@ def add_cors_headers(response):
     return response
 
 
-# --------------------------------------------------
-# INSTAGRAM URL CHECK
-# --------------------------------------------------
+# =========================================================
+# INSTAGRAM URL VALIDATION
+# =========================================================
 
 def is_valid_instagram_url(url):
     try:
@@ -69,9 +69,9 @@ def is_valid_instagram_url(url):
         return False
 
 
-# --------------------------------------------------
-# FFPROBE - CHECK FINAL FILE
-# --------------------------------------------------
+# =========================================================
+# FFPROBE MEDIA INFORMATION
+# =========================================================
 
 def get_media_info(file_path):
     ffprobe = shutil.which("ffprobe")
@@ -105,12 +105,15 @@ def get_media_info(file_path):
 
         return result.stdout
 
-    except Exception:
+    except Exception as exc:
+        app.logger.warning(
+            "FFprobe error: %s",
+            str(exc)
+        )
         return None
 
 
 def has_audio_stream(file_path):
-
     info = get_media_info(file_path)
 
     if not info:
@@ -120,7 +123,6 @@ def has_audio_stream(file_path):
 
 
 def has_video_stream(file_path):
-
     info = get_media_info(file_path)
 
     if not info:
@@ -129,9 +131,9 @@ def has_video_stream(file_path):
     return '"codec_type": "video"' in info
 
 
-# --------------------------------------------------
-# FIND DOWNLOADED FILES
-# --------------------------------------------------
+# =========================================================
+# FIND DOWNLOADED MEDIA
+# =========================================================
 
 def get_downloaded_files(temp_dir):
 
@@ -169,16 +171,113 @@ def get_downloaded_files(temp_dir):
     return result
 
 
-# --------------------------------------------------
-# CONVERT / MERGE USING FFMPEG
-# --------------------------------------------------
+# =========================================================
+# FFMPEG MERGE VIDEO + AUDIO
+# =========================================================
 
-def make_final_mp4(input_file, temp_dir):
+def merge_video_audio(video_file, audio_file, temp_dir):
 
     ffmpeg = shutil.which("ffmpeg")
 
     if not ffmpeg:
-        raise RuntimeError("FFmpeg is not available.")
+        raise RuntimeError(
+            "FFmpeg is not available on Render."
+        )
+
+    output_file = os.path.join(
+        temp_dir,
+        "instagram_merged.mp4"
+    )
+
+    command = [
+        ffmpeg,
+        "-y",
+
+        "-i",
+        video_file,
+
+        "-i",
+        audio_file,
+
+        "-map",
+        "0:v:0",
+
+        "-map",
+        "1:a:0",
+
+        "-c:v",
+        "copy",
+
+        "-c:a",
+        "aac",
+
+        "-b:a",
+        "192k",
+
+        "-movflags",
+        "+faststart",
+
+        output_file
+    ]
+
+    app.logger.info(
+        "FFmpeg: merging video and audio..."
+    )
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False
+    )
+
+    if result.returncode != 0:
+
+        app.logger.error(
+            "FFmpeg merge error:\n%s",
+            result.stderr[-8000:]
+        )
+
+        raise RuntimeError(
+            "FFmpeg could not merge video and audio."
+        )
+
+    if not os.path.isfile(output_file):
+        raise RuntimeError(
+            "FFmpeg did not create merged MP4."
+        )
+
+    if os.path.getsize(output_file) <= 0:
+        raise RuntimeError(
+            "Merged MP4 is empty."
+        )
+
+    if not has_video_stream(output_file):
+        raise RuntimeError(
+            "Merged MP4 has no video stream."
+        )
+
+    if not has_audio_stream(output_file):
+        raise RuntimeError(
+            "Merged MP4 has no audio stream."
+        )
+
+    return output_file
+
+
+# =========================================================
+# FFMPEG RE-MUX / FINALIZE
+# =========================================================
+
+def finalize_video(input_file, temp_dir):
+
+    ffmpeg = shutil.which("ffmpeg")
+
+    if not ffmpeg:
+        raise RuntimeError(
+            "FFmpeg is not available on Render."
+        )
 
     output_file = os.path.join(
         temp_dir,
@@ -188,6 +287,7 @@ def make_final_mp4(input_file, temp_dir):
     command = [
         ffmpeg,
         "-y",
+
         "-i",
         input_file,
 
@@ -213,7 +313,7 @@ def make_final_mp4(input_file, temp_dir):
     ]
 
     app.logger.info(
-        "Running FFmpeg final conversion..."
+        "FFmpeg: finalizing downloaded video..."
     )
 
     result = subprocess.run(
@@ -227,30 +327,30 @@ def make_final_mp4(input_file, temp_dir):
     if result.returncode != 0:
 
         app.logger.error(
-            "FFmpeg error:\n%s",
-            result.stderr[-5000:]
+            "FFmpeg finalization error:\n%s",
+            result.stderr[-8000:]
         )
 
         raise RuntimeError(
-            "FFmpeg could not create the final MP4."
+            "FFmpeg could not finalize the MP4."
         )
 
     if not os.path.isfile(output_file):
         raise RuntimeError(
-            "FFmpeg did not create the final MP4."
+            "Final MP4 was not created."
         )
 
     if os.path.getsize(output_file) <= 0:
         raise RuntimeError(
-            "Final MP4 file is empty."
+            "Final MP4 is empty."
         )
 
     return output_file
 
 
-# --------------------------------------------------
+# =========================================================
 # YT-DLP DOWNLOAD
-# --------------------------------------------------
+# =========================================================
 
 def download_instagram(url, temp_dir):
 
@@ -259,269 +359,308 @@ def download_instagram(url, temp_dir):
         "%(id)s.%(ext)s"
     )
 
-    ydl_opts = {
+    ffmpeg_path = shutil.which("ffmpeg")
 
-        # IMPORTANT
-        "quiet": False,
-        "no_warnings": False,
-        "verbose": True,
-
-        "noplaylist": True,
-
-        # Prefer separate video + audio.
-        # If unavailable, use combined stream.
-        "format": (
-            "bestvideo*+bestaudio/"
-            "bestvideo+bestaudio/"
-            "best"
-        ),
-
-        "outtmpl": output_template,
-
-        "merge_output_format": "mp4",
-
-        "ffmpeg_location": shutil.which("ffmpeg"),
-
-        "retries": 5,
-        "fragment_retries": 5,
-        "extractor_retries": 3,
-
-        "socket_timeout": 45,
-
-        "overwrites": True,
-
-        "continuedl": False,
-
-        "concurrent_fragment_downloads": 1,
-
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 "
-                "(Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/155.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9"
-        },
-
-        "extractor_args": {
-            "instagram": {
-                "api": ["web"]
-            }
-        }
-    }
-
-    app.logger.info(
-        "Starting Instagram yt-dlp download..."
-    )
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-
-        info = ydl.extract_info(
-            url,
-            download=True
-        )
-
-    if not info:
+    if not ffmpeg_path:
         raise RuntimeError(
-            "Instagram did not return media information."
+            "FFmpeg is not available."
         )
 
-    files = get_downloaded_files(temp_dir)
-
-    if not files:
-        raise RuntimeError(
-            "No downloaded media file was found."
-        )
-
-    app.logger.info(
-        "Downloaded files: %s",
-        [
-            os.path.basename(x)
-            for x in files
-        ]
-    )
-
-    # --------------------------------------------------
-    # 1. Prefer MP4 containing video + audio
-    # --------------------------------------------------
-
-    mp4_files = [
-        x for x in files
-        if x.lower().endswith(".mp4")
+    # Important:
+    # First try combined streams.
+    # Then try video + audio.
+    # Then best available format.
+    format_options = [
+        "best[ext=mp4]/best",
+        "bv*+ba/b",
+        "bestvideo*+bestaudio/best",
+        "best"
     ]
 
-    for file_path in sorted(
-        mp4_files,
-        key=os.path.getsize,
-        reverse=True
+    last_error = None
+
+    for attempt_number, format_selector in enumerate(
+        format_options,
+        start=1
     ):
 
-        if has_video_stream(file_path):
+        app.logger.info(
+            "================================================="
+        )
 
-            if has_audio_stream(file_path):
+        app.logger.info(
+            "Instagram download attempt %s",
+            attempt_number
+        )
 
-                app.logger.info(
-                    "Found MP4 with video + audio: %s",
+        app.logger.info(
+            "Format selector: %s",
+            format_selector
+        )
+
+        app.logger.info(
+            "================================================="
+        )
+
+        # Clean previous attempt files
+        for name in os.listdir(temp_dir):
+
+            path = os.path.join(
+                temp_dir,
+                name
+            )
+
+            try:
+
+                if os.path.isfile(path) or os.path.islink(path):
+                    os.remove(path)
+
+                elif os.path.isdir(path):
+                    shutil.rmtree(path)
+
+            except OSError as exc:
+
+                app.logger.warning(
+                    "Could not remove retry file %s: %s",
+                    path,
+                    str(exc)
+                )
+
+        ydl_opts = {
+
+            "quiet": False,
+
+            "no_warnings": False,
+
+            "verbose": True,
+
+            "noplaylist": True,
+
+            "format": format_selector,
+
+            "outtmpl": output_template,
+
+            "merge_output_format": "mp4",
+
+            "ffmpeg_location": ffmpeg_path,
+
+            "retries": 5,
+
+            "fragment_retries": 5,
+
+            "extractor_retries": 3,
+
+            "socket_timeout": 45,
+
+            "overwrites": True,
+
+            "continuedl": False,
+
+            "concurrent_fragment_downloads": 1,
+
+            "http_headers": {
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) "
+                    "Chrome/155.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9"
+            },
+
+            "extractor_args": {
+                "instagram": {
+                    "api": ["web"]
+                }
+            }
+        }
+
+        try:
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+
+                info = ydl.extract_info(
+                    url,
+                    download=True
+                )
+
+            if not info:
+                raise RuntimeError(
+                    "Instagram did not return media information."
+                )
+
+            files = get_downloaded_files(
+                temp_dir
+            )
+
+            if not files:
+                raise RuntimeError(
+                    "No downloaded media file was found."
+                )
+
+            app.logger.info(
+                "Files downloaded: %s",
+                [
+                    os.path.basename(x)
+                    for x in files
+                ]
+            )
+
+            # -------------------------------------------------
+            # CHECK EVERY FILE
+            # -------------------------------------------------
+
+            for file_path in sorted(
+                files,
+                key=os.path.getsize,
+                reverse=True
+            ):
+
+                video = has_video_stream(
                     file_path
                 )
 
-                return info, file_path
+                audio = has_audio_stream(
+                    file_path
+                )
 
+                app.logger.info(
+                    "Media check: %s | video=%s | audio=%s | size=%s",
+                    os.path.basename(file_path),
+                    video,
+                    audio,
+                    os.path.getsize(file_path)
+                )
 
-    # --------------------------------------------------
-    # 2. Find any video file
-    # --------------------------------------------------
+                # Combined video + audio
+                if video and audio:
 
-    video_files = [
-        x for x in files
-        if has_video_stream(x)
-    ]
+                    app.logger.info(
+                        "SUCCESS: Combined video + audio found."
+                    )
 
-    if not video_files:
+                    final_file = finalize_video(
+                        file_path,
+                        temp_dir
+                    )
 
-        raise RuntimeError(
-            "No video stream was downloaded."
-        )
+                    if has_audio_stream(final_file):
 
+                        return info, final_file
 
-    # --------------------------------------------------
-    # 3. If video already contains audio
-    # --------------------------------------------------
+            # -------------------------------------------------
+            # SEPARATE VIDEO + AUDIO
+            # -------------------------------------------------
 
-    for file_path in sorted(
-        video_files,
-        key=os.path.getsize,
-        reverse=True
-    ):
+            video_files = [
+                path
+                for path in files
+                if has_video_stream(path)
+            ]
 
-        if has_audio_stream(file_path):
+            audio_files = [
+                path
+                for path in files
+                if has_audio_stream(path)
+            ]
 
             app.logger.info(
-                "Video already contains audio: %s",
-                file_path
+                "Video files: %s",
+                len(video_files)
             )
 
-            return info, file_path
+            app.logger.info(
+                "Audio files: %s",
+                len(audio_files)
+            )
 
+            if video_files and audio_files:
 
-    # --------------------------------------------------
-    # 4. Separate audio file exists
-    # --------------------------------------------------
+                video_file = max(
+                    video_files,
+                    key=os.path.getsize
+                )
 
-    audio_files = [
-        x for x in files
-        if has_audio_stream(x)
-    ]
+                audio_file = max(
+                    audio_files,
+                    key=os.path.getsize
+                )
 
-    if audio_files:
+                app.logger.info(
+                    "Separate video stream found: %s",
+                    os.path.basename(video_file)
+                )
 
-        video_file = max(
-            video_files,
-            key=os.path.getsize
-        )
+                app.logger.info(
+                    "Separate audio stream found: %s",
+                    os.path.basename(audio_file)
+                )
 
-        audio_file = max(
-            audio_files,
-            key=os.path.getsize
-        )
+                merged_file = merge_video_audio(
+                    video_file,
+                    audio_file,
+                    temp_dir
+                )
 
-        merged_file = os.path.join(
-            temp_dir,
-            "instagram_merged.mp4"
-        )
+                return info, merged_file
 
-        ffmpeg = shutil.which("ffmpeg")
+            # -------------------------------------------------
+            # VIDEO ONLY
+            # -------------------------------------------------
 
-        if not ffmpeg:
+            if video_files:
+
+                largest_video = max(
+                    video_files,
+                    key=os.path.getsize
+                )
+
+                app.logger.warning(
+                    "Video downloaded but NO audio stream was exposed."
+                )
+
+                app.logger.warning(
+                    "Video-only file: %s",
+                    os.path.basename(largest_video)
+                )
+
+                raise RuntimeError(
+                    "Instagram returned a video-only stream "
+                    "without an audio track."
+                )
 
             raise RuntimeError(
-                "FFmpeg is not available."
+                "Instagram returned no usable video stream."
             )
 
-        command = [
-            ffmpeg,
-            "-y",
+        except Exception as exc:
 
-            "-i",
-            video_file,
+            last_error = exc
 
-            "-i",
-            audio_file,
+            app.logger.warning(
+                "Attempt %s failed: %s",
+                attempt_number,
+                str(exc)
+            )
 
-            "-map",
-            "0:v:0",
+            continue
 
-            "-map",
-            "1:a:0",
+    if last_error:
 
-            "-c:v",
-            "copy",
-
-            "-c:a",
-            "aac",
-
-            "-b:a",
-            "192k",
-
-            "-movflags",
-            "+faststart",
-
-            merged_file
-        ]
-
-        app.logger.info(
-            "Merging separate video + audio streams..."
+        raise RuntimeError(
+            "All Instagram download attempts failed. "
+            + str(last_error)
         )
-
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=180,
-            check=False
-        )
-
-        if result.returncode != 0:
-
-            app.logger.error(
-                "FFmpeg merge error:\n%s",
-                result.stderr[-5000:]
-            )
-
-            raise RuntimeError(
-                "Video and audio could not be merged."
-            )
-
-        if not os.path.isfile(merged_file):
-
-            raise RuntimeError(
-                "Merged MP4 was not created."
-            )
-
-        if not has_audio_stream(merged_file):
-
-            raise RuntimeError(
-                "Merged MP4 still has no audio."
-            )
-
-        return info, merged_file
-
-
-    # --------------------------------------------------
-    # 5. No audio stream available
-    # --------------------------------------------------
 
     raise RuntimeError(
-        "Instagram did not provide a separate audio stream "
-        "for this Reel."
+        "Instagram download failed."
     )
 
 
-# --------------------------------------------------
+# =========================================================
 # HOME
-# --------------------------------------------------
+# =========================================================
 
 @app.route("/", methods=["GET"])
 def home():
@@ -572,9 +711,9 @@ def home():
     """
 
 
-# --------------------------------------------------
+# =========================================================
 # HEALTH
-# --------------------------------------------------
+# =========================================================
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -595,11 +734,14 @@ def health():
     })
 
 
-# --------------------------------------------------
-# OPTIONS
-# --------------------------------------------------
+# =========================================================
+# OPTIONS / PREFLIGHT
+# =========================================================
 
-@app.route("/download", methods=["OPTIONS"])
+@app.route(
+    "/download",
+    methods=["OPTIONS"]
+)
 def download_options():
 
     return Response(
@@ -608,11 +750,14 @@ def download_options():
     )
 
 
-# --------------------------------------------------
-# DOWNLOAD API
-# --------------------------------------------------
+# =========================================================
+# DOWNLOAD
+# =========================================================
 
-@app.route("/download", methods=["POST"])
+@app.route(
+    "/download",
+    methods=["POST"]
+)
 def download():
 
     data = request.get_json(
@@ -623,6 +768,9 @@ def download():
         data.get("url") or ""
     ).strip()
 
+    app.logger.warning(
+        "=============================================="
+    )
 
     app.logger.warning(
         "DOWNLOAD REQUEST RECEIVED"
@@ -633,8 +781,14 @@ def download():
         url.split("?")[0]
     )
 
+    app.logger.warning(
+        "=============================================="
+    )
 
-    # URL missing
+    # -------------------------------------------------
+    # URL CHECK
+    # -------------------------------------------------
+
     if not url:
 
         return jsonify({
@@ -646,8 +800,6 @@ def download():
 
         }), 400
 
-
-    # URL invalid
     if not is_valid_instagram_url(url):
 
         return jsonify({
@@ -659,8 +811,10 @@ def download():
 
         }), 400
 
+    # -------------------------------------------------
+    # FFMPEG CHECK
+    # -------------------------------------------------
 
-    # FFmpeg check
     if not shutil.which("ffmpeg"):
 
         return jsonify({
@@ -672,11 +826,13 @@ def download():
 
         }), 503
 
+    # -------------------------------------------------
+    # TEMP DIRECTORY
+    # -------------------------------------------------
 
     temp_dir = tempfile.mkdtemp(
         prefix="instagram_download_"
     )
-
 
     try:
 
@@ -685,13 +841,11 @@ def download():
             temp_dir
         )
 
-
         if not final_path:
 
             raise RuntimeError(
                 "No final video was created."
             )
-
 
         if not os.path.isfile(final_path):
 
@@ -699,18 +853,15 @@ def download():
                 "Final video file does not exist."
             )
 
-
         file_size = os.path.getsize(
             final_path
         )
-
 
         if file_size <= 0:
 
             raise RuntimeError(
                 "Downloaded file is empty."
             )
-
 
         if not has_video_stream(
             final_path
@@ -720,7 +871,6 @@ def download():
                 "Final file does not contain video."
             )
 
-
         if not has_audio_stream(
             final_path
         ):
@@ -729,16 +879,13 @@ def download():
                 "Final file does not contain audio."
             )
 
-
         token = uuid.uuid4().hex
-
 
         title = (
             info.get("title")
             or info.get("id")
             or "instagram_reel"
         )
-
 
         with DOWNLOADS_LOCK:
 
@@ -755,12 +902,10 @@ def download():
 
             }
 
-
         app.logger.info(
             "DOWNLOAD READY: %s bytes",
             file_size
         )
-
 
         return jsonify({
 
@@ -783,45 +928,40 @@ def download():
 
         })
 
-
     except Exception as exc:
 
         app.logger.exception(
             "Instagram download failed"
         )
 
-
-        shutil.rmtree(
-            temp_dir,
-            ignore_errors=True
-        )
-
-
         error_text = str(
             exc
         )
-
 
         app.logger.error(
             "FINAL ERROR: %s",
             error_text
         )
 
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True
+        )
 
         return jsonify({
 
             "success": False,
 
             "error":
-                "Could not download this Reel with audio. "
+                "Could not download this Reel. "
                 + error_text
 
         }), 502
 
 
-# --------------------------------------------------
+# =========================================================
 # SEND FILE
-# --------------------------------------------------
+# =========================================================
 
 @app.route(
     "/file/<token>",
@@ -835,7 +975,6 @@ def get_file(token):
             token
         )
 
-
     if not item:
 
         return jsonify({
@@ -848,9 +987,7 @@ def get_file(token):
 
         }), 404
 
-
     path = item["path"]
-
 
     if not os.path.isfile(path):
 
@@ -863,27 +1000,50 @@ def get_file(token):
 
         }), 404
 
+    # -------------------------------------------------
+    # FINAL AUDIO CHECK
+    # -------------------------------------------------
+
+    if not has_video_stream(path):
+
+        return jsonify({
+
+            "success": False,
+
+            "error":
+                "Video stream was not found."
+
+        }), 502
+
+    if not has_audio_stream(path):
+
+        return jsonify({
+
+            "success": False,
+
+            "error":
+                "Audio stream was not found."
+
+        }), 502
+
+    # -------------------------------------------------
+    # FILE NAME
+    # -------------------------------------------------
 
     filename = re.sub(
-
         r"[^A-Za-z0-9._-]",
-
         "_",
-
         item.get(
             "title",
             "instagram_reel"
         )
-
     )[:100]
-
 
     if not filename.lower().endswith(
         ".mp4"
     ):
 
         filename += ".mp4"
-
 
     try:
 
@@ -903,16 +1063,13 @@ def get_file(token):
 
         )
 
-
         response.headers[
             "Cache-Control"
         ] = "no-store"
 
-
         response.headers[
             "X-Content-Type-Options"
         ] = "nosniff"
-
 
         def cleanup():
 
@@ -923,27 +1080,22 @@ def get_file(token):
                     None
                 )
 
-
             shutil.rmtree(
                 item["temp_dir"],
                 ignore_errors=True
             )
 
-
         response.call_on_close(
             cleanup
         )
 
-
         return response
 
-
-    except Exception:
+    except Exception as exc:
 
         app.logger.exception(
             "File delivery failed"
         )
-
 
         return jsonify({
 
@@ -951,14 +1103,14 @@ def get_file(token):
 
             "error":
                 "Could not send the video. "
-                "Please try again."
+                + str(exc)
 
         }), 502
 
 
-# --------------------------------------------------
-# START SERVER
-# --------------------------------------------------
+# =========================================================
+# SERVER
+# =========================================================
 
 if __name__ == "__main__":
 
