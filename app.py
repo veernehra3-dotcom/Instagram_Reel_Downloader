@@ -1,11 +1,13 @@
 import os
 import re
+import json
 import uuid
 import shutil
 import tempfile
 import threading
 import subprocess
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
+from urllib.request import Request, urlopen
 
 import yt_dlp
 from flask import Flask, request, jsonify, Response, send_file
@@ -49,6 +51,11 @@ def is_valid_instagram_url(url):
         return False
 
 
+def extract_shortcode(url):
+    match = re.search(r"/(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)", url)
+    return match.group(1) if match else "reel"
+
+
 def get_media_streams_info(file_path):
     ffmpeg = get_ffmpeg_path()
     if not ffmpeg or not os.path.isfile(file_path):
@@ -70,37 +77,48 @@ def has_audio_stream(file_path):
     return "Audio:" in get_media_streams_info(file_path)
 
 
+def download_file_from_url(media_url, output_path):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Referer": "https://www.instagram.com/"
+    }
+    req = Request(media_url, headers=headers)
+    with urlopen(req, timeout=45) as resp, open(output_path, "wb") as out_file:
+        shutil.copyfileobj(resp, out_file)
+    return output_path
+
+
 # =========================================================
-# YT-DLP MASTER DOWNLOADER (WITH INSTAGRAM WEB API BYPASS)
+# SMART DUAL-ENGINE DOWNLOADER
 # =========================================================
 
 def download_instagram(url, temp_dir):
-    output_template = os.path.join(temp_dir, "%(id)s.%(ext)s")
+    shortcode = extract_shortcode(url)
     ffmpeg_path = get_ffmpeg_path()
 
-    ydl_opts = {
-        'format': 'bestvideo+bestaudio/best',
-        'outtmpl': output_template,
-        'merge_output_format': 'mp4',
-        'ffmpeg_location': ffmpeg_path,
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-        'socket_timeout': 30,
-        # यह लाइन Instagram के नए ऑडियो सिस्टम को बाईपास करने के लिए सबसे ज़रूरी है
-        'extractor_args': {
-            'instagram': {
-                'api': ['web', 'graphql']
-            }
-        },
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        }
-    }
-
+    # इंजन 1: yt-dlp (Advanced Extractor Args के साथ)
     try:
+        output_template = os.path.join(temp_dir, "%(id)s.%(ext)s")
+        ydl_opts = {
+            'format': 'bestvideo+bestaudio/best',
+            'outtmpl': output_template,
+            'merge_output_format': 'mp4',
+            'ffmpeg_location': ffmpeg_path,
+            'quiet': True,
+            'no_warnings': True,
+            'noplaylist': True,
+            'socket_timeout': 30,
+            'extractor_args': {
+                'instagram': {
+                    'api': ['web', 'graphql']
+                }
+            },
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+                'Accept-Language': 'en-US,en;q=0.9',
+            }
+        }
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             
@@ -109,11 +127,32 @@ def download_instagram(url, temp_dir):
             best_file = max(files, key=os.path.getsize)
             if os.path.getsize(best_file) > 10000 and has_audio_stream(best_file):
                 return info, best_file
-
     except Exception as exc:
-        raise RuntimeError(str(exc))
+        app.logger.warning("yt-dlp engine failed: %s", str(exc))
 
-    raise RuntimeError("Could not extract audio track for this reel. Instagram updated security.")
+    # इंजन 2: Safe Public API Fallback (Instagram के ब्लॉक को बायपास करने के लिए)
+    try:
+        api_url = "https://vkrdownloader.xyz/server?vkr=" + quote(url)
+        req = Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=20) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            if "application/json" in content_type:
+                res_data = json.loads(resp.read().decode("utf-8"))
+                data = res_data.get("data", {})
+                downloads = data.get("downloads", [])
+                for item in downloads:
+                    dl_url = item.get("url")
+                    if dl_url:
+                        out_file = os.path.join(temp_dir, f"{shortcode}_fallback.mp4")
+                        download_file_from_url(dl_url, out_file)
+                        if os.path.isfile(out_file) and os.path.getsize(out_file) > 10000:
+                            if has_audio_stream(out_file):
+                                title = data.get("title") or f"instagram_reel_{shortcode}"
+                                return {"id": shortcode, "title": title}, out_file
+    except Exception as exc:
+        app.logger.warning("API fallback engine failed: %s", str(exc))
+
+    raise RuntimeError("Could not extract audio track for this reel due to strict Instagram security.")
 
 
 @app.route("/", methods=["GET"])
@@ -185,5 +224,5 @@ def get_file(token):
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.Connection.get("PORT", "5000") if hasattr(os.environ, "Connection") else os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
