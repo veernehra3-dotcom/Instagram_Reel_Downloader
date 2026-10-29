@@ -1,13 +1,13 @@
 import os
 import re
+import json
 import uuid
 import shutil
 import tempfile
 import threading
-import subprocess
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
+from urllib.request import Request, urlopen
 
-import yt_dlp
 from flask import Flask, request, jsonify, Response, send_file
 
 app = Flask(__name__)
@@ -49,71 +49,62 @@ def is_valid_instagram_url(url):
         return False
 
 
-def get_media_streams_info(file_path):
-    ffmpeg = get_ffmpeg_path()
-    if not ffmpeg or not os.path.isfile(file_path):
-        return ""
-    try:
-        result = subprocess.run(
-            [ffmpeg, "-hide_banner", "-i", file_path],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False
-        )
-        return result.stderr or ""
-    except Exception:
-        return ""
+def extract_shortcode(url):
+    match = re.search(r"/(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)", url)
+    return match.group(1) if match else "reel"
 
 
-def has_audio_stream(file_path):
-    return "Audio:" in get_media_streams_info(file_path)
+def download_file_from_url(media_url, output_path):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Referer": "https://www.instagram.com/"
+    }
+    req = Request(media_url, headers=headers)
+    with urlopen(req, timeout=45) as resp, open(output_path, "wb") as out_file:
+        shutil.copyfileobj(resp, out_file)
+    return output_path
 
 
 # =========================================================
-# COOKIE-BASED SECURE DOWNLOADER
+# ULTIMATE STABLE API-BASED DOWNLOADER
 # =========================================================
 
 def download_instagram(url, temp_dir):
-    output_template = os.path.join(temp_dir, "%(id)s.%(ext)s")
-    ffmpeg_path = get_ffmpeg_path()
+    shortcode = extract_shortcode(url)
+    
+    # इंटरनेट पर मौजूद सबसे बेहतरीन पब्लिक डाउनलोडर API का इस्तेमाल
+    api_endpoints = [
+        f"https://vkrdownloader.xyz/server?vkr={quote(url)}",
+        f"https://saveig.app/api/ajaxSearch?q={quote(url)}"
+    ]
 
-    cookies_content = os.environ.get("IG_COOKIES", "").strip()
-    cookies_file_path = None
+    for api_url in api_endpoints:
+        try:
+            req = Request(api_url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "X-Requested-With": "XMLHttpRequest"
+            })
+            with urlopen(req, timeout=20) as resp:
+                raw_text = resp.read().decode("utf-8", errors="ignore")
+                if not raw_text.strip():
+                    continue
+                res_data = json.loads(raw_text)
+                
+                # VKR Downloader format check
+                downloads = res_data.get("data", {}).get("downloads", [])
+                for item in downloads:
+                    dl_url = item.get("url")
+                    if dl_url and (".mp4" in dl_url or "cdninstagram" in dl_url):
+                        out_file = os.path.join(temp_dir, f"{shortcode}.mp4")
+                        download_file_from_url(dl_url, out_file)
+                        if os.path.isfile(out_file) and os.path.getsize(out_file) > 15000:
+                            title = res_data.get("data", {}).get("title") or f"instagram_reel_{shortcode}"
+                            return {"id": shortcode, "title": title}, out_file
 
-    if cookies_content:
-        cookies_file_path = os.path.join(temp_dir, "cookies.txt")
-        with open(cookies_file_path, "w", encoding="utf-8") as f:
-            f.write(cookies_content)
+        except Exception as exc:
+            continue
 
-    ydl_opts = {
-        'format': 'bestvideo+bestaudio/best',
-        'outtmpl': output_template,
-        'merge_output_format': 'mp4',
-        'ffmpeg_location': ffmpeg_path,
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-        'socket_timeout': 30,
-    }
-
-    if cookies_file_path and os.path.isfile(cookies_file_path):
-        ydl_opts['cookiefile'] = cookies_file_path
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            
-        files = [os.path.join(temp_dir, f) for f in os.listdir(temp_dir) if f.endswith('.mp4')]
-        if files:
-            best_file = max(files, key=os.path.getsize)
-            if os.path.getsize(best_file) > 10000 and has_audio_stream(best_file):
-                return info, best_file
-
-    except Exception as exc:
-        raise RuntimeError(str(exc))
-
-    raise RuntimeError("Could not download reel with audio. Please check if your Instagram cookies are valid.")
+    raise RuntimeError("Instagram security blocked all download paths. Please use a RapidAPI key for 100% uptime.")
 
 
 @app.route("/", methods=["GET"])
@@ -123,11 +114,7 @@ def home():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "online",
-        "ffmpeg_available": bool(get_ffmpeg_path()),
-        "cookies_configured": bool(os.environ.get("IG_COOKIES"))
-    })
+    return jsonify({"status": "online", "ffmpeg_available": bool(get_ffmpeg_path())})
 
 
 @app.route("/download", methods=["OPTIONS"])
@@ -149,13 +136,12 @@ def download():
         info, final_path = download_instagram(url, temp_dir)
 
         token = uuid.uuid4().hex
-        title = info.get("title") or info.get("id") or "instagram_reel"
+        title = info.get("title") or "instagram_reel"
 
         with DOWNLOADS_LOCK:
             DOWNLOADS[token] = {"path": final_path, "temp_dir": temp_dir, "title": title}
 
         return jsonify({
-            "success": "true" if True else False,
             "success": True,
             "token": token,
             "title": title,
