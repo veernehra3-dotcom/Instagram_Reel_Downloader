@@ -1,13 +1,12 @@
 import os
 import re
-import json
 import uuid
 import shutil
 import tempfile
 import threading
-from urllib.parse import urlparse, quote
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
 
+import yt_dlp
 from flask import Flask, request, jsonify, Response, send_file
 
 app = Flask(__name__)
@@ -49,91 +48,44 @@ def is_valid_instagram_url(url):
         return False
 
 
-def extract_shortcode(url):
-    match = re.search(r"/(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)", url)
-    return match.group(1) if match else "reel"
-
-
-def download_file_from_url(media_url, output_path):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
-        "Referer": "https://www.instagram.com/"
-    }
-    req = Request(media_url, headers=headers)
-    with urlopen(req, timeout=45) as resp, open(output_path, "wb") as out_file:
-        shutil.copyfileobj(resp, out_file)
-    return output_path
-
-
 # =========================================================
-# INSTAGRAM MOBILE API & EMBED BYPASS SCRAPER
+# YT-DLP MASTER DOWNLOADER (AUTOMATIC AUDIO+VIDEO MERGE)
 # =========================================================
 
 def download_instagram(url, temp_dir):
-    shortcode = extract_shortcode(url)
-    last_error = None
+    output_template = os.path.join(temp_dir, "%(id)s.%(ext)s")
+    ffmpeg_path = get_ffmpeg_path()
 
-    # तरीका 1: Instagram Embed JSON API (बिना किसी थर्ड-पार्टी API के डायरेक्ट)
-    try:
-        embed_api = f"https://api.instagram.com/oembed/?url={quote(url)}"
-        req = Request(embed_api, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-        with urlopen(req, timeout=15) as resp:
-            # अगर यह चल गया तो ठीक, वरना आगे बढ़ेंगे
-            pass
-    except Exception:
-        pass
-
-    # तरीका 2: Instagram GraphQL Query (Mobile App Simulation)
-    try:
-        graphql_url = (
-            "https://www.instagram.com/graphql/query/"
-            "?doc_id=8845758582119845&variables="
-            + quote(json.dumps({"shortcode": shortcode}))
-        )
-        headers = {
-            "User-Agent": "Instagram 289.0.0.77.109 Android (33/13; 420dpi; 1080x2400; samsung; SM-G991B; o1s; exynos2100; en_US; 482924614)",
-            "Accept": "*/*",
-            "X-IG-App-ID": "936619743392459"
+    ydl_opts = {
+        'format': 'bestvideo+bestaudio/best',
+        'outtmpl': output_template,
+        'merge_output_format': 'mp4',
+        'ffmpeg_location': ffmpeg_path,
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'socket_timeout': 30,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
         }
-        req = Request(graphql_url, headers=headers)
-        with urlopen(req, timeout=20) as resp:
-            raw_text = resp.read().decode("utf-8", errors="ignore")
-            data = json.loads(raw_text)
-            media = (
-                data.get("data", {}).get("xdt_shortcode_media")
-                or data.get("data", {}).get("shortcode_media")
-                or {}
-            )
-            video_url = media.get("video_url")
-            if video_url:
-                out_file = os.path.join(temp_dir, f"{shortcode}_gql.mp4")
-                download_file_from_url(video_url, out_file)
-                if os.path.isfile(out_file) and os.path.getsize(out_file) > 10000:
-                    return {"id": shortcode, "title": f"reel_{shortcode}"}, out_file
-    except Exception as exc:
-        last_error = str(exc)
+    }
 
-    # तरीका 3: Captioned Embed Page Scrape (Alternative Fallback)
     try:
-        embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)"
-        }
-        req = Request(embed_url, headers=headers)
-        with urlopen(req, timeout=20) as resp:
-            html = resp.read().decode("utf-8", errors="ignore").replace("\\/", "/")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
             
-        matches = re.findall(r'"video_url"\s*:\s*"([^"]+)"', html)
-        for match in matches:
-            clean_url = match.encode("utf-8").decode("unicode_escape")
-            out_file = os.path.join(temp_dir, f"{shortcode}_embed.mp4")
-            download_file_from_url(clean_url, out_file)
-            if os.path.isfile(out_file) and os.path.getsize(out_file) > 10000:
-                return {"id": shortcode, "title": f"reel_{shortcode}"}, out_file
-    except Exception as exc:
-        last_error = str(exc)
+            # डाउनलोड हुई सही .mp4 फाइल ढूँढना
+            files = [os.path.join(temp_dir, f) for f in os.listdir(temp_dir) if f.endswith('.mp4')]
+            if files:
+                # सबसे बड़ी फाइल चुनें जिसमें वीडियो और ऑडियो दोनों हों
+                best_file = max(files, key=os.path.getsize)
+                if os.path.getsize(best_file) > 10000:
+                    return info, best_file
 
-    raise RuntimeError(f"Could not fetch media. Instagram blocked the request. ({last_error or 'Blocked'})")
+    except Exception as exc:
+        raise RuntimeError(str(exc))
+
+    raise RuntimeError("Could not download this Reel using yt-dlp.")
 
 
 @app.route("/", methods=["GET"])
@@ -165,7 +117,7 @@ def download():
         info, final_path = download_instagram(url, temp_dir)
 
         token = uuid.uuid4().hex
-        title = info.get("title") or "instagram_reel"
+        title = info.get("title") or info.get("id") or "instagram_reel"
 
         with DOWNLOADS_LOCK:
             DOWNLOADS[token] = {"path": final_path, "temp_dir": temp_dir, "title": title}
