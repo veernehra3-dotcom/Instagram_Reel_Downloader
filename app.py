@@ -56,7 +56,7 @@ def extract_shortcode(url):
 
 def download_file_from_url(media_url, output_path):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
         "Referer": "https://www.instagram.com/"
     }
     req = Request(media_url, headers=headers)
@@ -66,56 +66,74 @@ def download_file_from_url(media_url, output_path):
 
 
 # =========================================================
-# BULLETPROOF DOWNLOADER (API + SCRAPE HYBRID)
+# INSTAGRAM MOBILE API & EMBED BYPASS SCRAPER
 # =========================================================
 
 def download_instagram(url, temp_dir):
     shortcode = extract_shortcode(url)
     last_error = None
 
-    # तरीका 1: स्टेबल पब्लिक डाउनलोडर API (Instagram के ब्लॉक को आसानी से पार कर लेता है)
+    # तरीका 1: Instagram Embed JSON API (बिना किसी थर्ड-पार्टी API के डायरेक्ट)
     try:
-        api_url = "https://vkrdownloader.xyz/server?vkr=" + quote(url)
-        req = Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urlopen(req, timeout=25) as resp:
-            res_data = json.loads(resp.read().decode("utf-8"))
-            data = res_data.get("data", {})
-            downloads = data.get("downloads", [])
-            for item in downloads:
-                dl_url = item.get("url")
-                if dl_url:
-                    out_file = os.path.join(temp_dir, f"{shortcode}_api.mp4")
-                    download_file_from_url(dl_url, out_file)
-                    if os.path.isfile(out_file) and os.path.getsize(out_file) > 10000:
-                        title = data.get("title") or f"instagram_reel_{shortcode}"
-                        return {"id": shortcode, "title": title}, out_file
-    except Exception as exc:
-        last_error = str(exc)
+        embed_api = f"https://api.instagram.com/oembed/?url={quote(url)}"
+        req = Request(embed_api, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        with urlopen(req, timeout=15) as resp:
+            # अगर यह चल गया तो ठीक, वरना आगे बढ़ेंगे
+            pass
+    except Exception:
+        pass
 
-    # तरीका 2: यदि API फेल हो, तो मोबाइल ऐप यूजर-एजेंट के साथ डायरेक्ट मेटा टैग स्क्रैपिंग ट्राई करें
+    # तरीका 2: Instagram GraphQL Query (Mobile App Simulation)
     try:
+        graphql_url = (
+            "https://www.instagram.com/graphql/query/"
+            "?doc_id=8845758582119845&variables="
+            + quote(json.dumps({"shortcode": shortcode}))
+        )
         headers = {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
-            "Accept-Language": "en-US,en;q=0.9"
+            "User-Agent": "Instagram 289.0.0.77.109 Android (33/13; 420dpi; 1080x2400; samsung; SM-G991B; o1s; exynos2100; en_US; 482924614)",
+            "Accept": "*/*",
+            "X-IG-App-ID": "936619743392459"
         }
-        req = Request(url, headers=headers)
+        req = Request(graphql_url, headers=headers)
         with urlopen(req, timeout=20) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-
-        video_match = re.search(r'<meta\s+property=["\']og:video["\']\s+content=["\']([^"\']+)["\']', html)
-        if video_match:
-            video_url = video_match.group(1).replace("&amp;", "&")
-            title_match = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html)
-            title = title_match.group(1) if title_match else f"instagram_reel_{shortcode}"
-            
-            out_file = os.path.join(temp_dir, f"{shortcode}_og.mp4")
-            download_file_from_url(video_url, out_file)
-            if os.path.isfile(out_file) and os.path.getsize(out_file) > 10000:
-                return {"id": shortcode, "title": title}, out_file
+            raw_text = resp.read().decode("utf-8", errors="ignore")
+            data = json.loads(raw_text)
+            media = (
+                data.get("data", {}).get("xdt_shortcode_media")
+                or data.get("data", {}).get("shortcode_media")
+                or {}
+            )
+            video_url = media.get("video_url")
+            if video_url:
+                out_file = os.path.join(temp_dir, f"{shortcode}_gql.mp4")
+                download_file_from_url(video_url, out_file)
+                if os.path.isfile(out_file) and os.path.getsize(out_file) > 10000:
+                    return {"id": shortcode, "title": f"reel_{shortcode}"}, out_file
     except Exception as exc:
         last_error = str(exc)
 
-    raise RuntimeError(f"Instagram blocked direct access. Error: {last_error or 'Unknown'}")
+    # तरीका 3: Captioned Embed Page Scrape (Alternative Fallback)
+    try:
+        embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)"
+        }
+        req = Request(embed_url, headers=headers)
+        with urlopen(req, timeout=20) as resp:
+            html = resp.read().decode("utf-8", errors="ignore").replace("\\/", "/")
+            
+        matches = re.findall(r'"video_url"\s*:\s*"([^"]+)"', html)
+        for match in matches:
+            clean_url = match.encode("utf-8").decode("unicode_escape")
+            out_file = os.path.join(temp_dir, f"{shortcode}_embed.mp4")
+            download_file_from_url(clean_url, out_file)
+            if os.path.isfile(out_file) and os.path.getsize(out_file) > 10000:
+                return {"id": shortcode, "title": f"reel_{shortcode}"}, out_file
+    except Exception as exc:
+        last_error = str(exc)
+
+    raise RuntimeError(f"Could not fetch media. Instagram blocked the request. ({last_error or 'Blocked'})")
 
 
 @app.route("/", methods=["GET"])
