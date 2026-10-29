@@ -1,10 +1,11 @@
 import os
 import re
+import json
 import uuid
 import shutil
 import tempfile
 import threading
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from urllib.request import Request, urlopen
 
 from flask import Flask, request, jsonify, Response, send_file
@@ -53,57 +54,68 @@ def extract_shortcode(url):
     return match.group(1) if match else "reel"
 
 
-# =========================================================
-# OPEN GRAPH (OG) META TAG SCRAPER (100% WORKING FOR AUDIO)
-# =========================================================
-
-def download_instagram_og(url, temp_dir):
-    shortcode = extract_shortcode(url)
-    
-    # Facebook/WhatsApp bot user-agent ताकि Instagram ब्लॉक न करे और सही Meta Tags दे
+def download_file_from_url(media_url, output_path):
     headers = {
-        "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-        "Accept-Language": "en-US,en;q=0.9"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer": "https://www.instagram.com/"
     }
+    req = Request(media_url, headers=headers)
+    with urlopen(req, timeout=45) as resp, open(output_path, "wb") as out_file:
+        shutil.copyfileobj(resp, out_file)
+    return output_path
 
+
+# =========================================================
+# BULLETPROOF DOWNLOADER (API + SCRAPE HYBRID)
+# =========================================================
+
+def download_instagram(url, temp_dir):
+    shortcode = extract_shortcode(url)
+    last_error = None
+
+    # तरीका 1: स्टेबल पब्लिक डाउनलोडर API (Instagram के ब्लॉक को आसानी से पार कर लेता है)
     try:
+        api_url = "https://vkrdownloader.xyz/server?vkr=" + quote(url)
+        req = Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=25) as resp:
+            res_data = json.loads(resp.read().decode("utf-8"))
+            data = res_data.get("data", {})
+            downloads = data.get("downloads", [])
+            for item in downloads:
+                dl_url = item.get("url")
+                if dl_url:
+                    out_file = os.path.join(temp_dir, f"{shortcode}_api.mp4")
+                    download_file_from_url(dl_url, out_file)
+                    if os.path.isfile(out_file) and os.path.getsize(out_file) > 10000:
+                        title = data.get("title") or f"instagram_reel_{shortcode}"
+                        return {"id": shortcode, "title": title}, out_file
+    except Exception as exc:
+        last_error = str(exc)
+
+    # तरीका 2: यदि API फेल हो, तो मोबाइल ऐप यूजर-एजेंट के साथ डायरेक्ट मेटा टैग स्क्रैपिंग ट्राई करें
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+            "Accept-Language": "en-US,en;q=0.9"
+        }
         req = Request(url, headers=headers)
         with urlopen(req, timeout=20) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
 
-        # Open Graph video link ढूँढना (इसमें ऑडियो हमेशा होता है)
         video_match = re.search(r'<meta\s+property=["\']og:video["\']\s+content=["\']([^"\']+)["\']', html)
-        if not video_match:
-            # वैकल्पिक तरीका: og:video:secure_url चेक करें
-            video_match = re.search(r'<meta\s+property=["\']og:video:secure_url["\']\s+content=["\']([^"\']+)["\']', html)
-
-        if not video_match:
-            raise RuntimeError("Instagram did not return media tags for this link.")
-
-        video_url = video_match.group(1).replace("&amp;", "&")
-
-        # Title ढूँढना
-        title_match = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html)
-        title = title_match.group(1) if title_match else f"instagram_reel_{shortcode}"
-        title = re.sub(r'<[^>]+>', '', title).strip()
-
-        # वीडियो फाइल डाउनलोड करें
-        out_file = os.path.join(temp_dir, f"{shortcode}.mp4")
-        dl_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://www.instagram.com/"
-        }
-        dl_req = Request(video_url, headers=dl_headers)
-        with urlopen(dl_req, timeout=45) as resp, open(out_file, "wb") as f:
-            shutil.copyfileobj(resp, f)
-
-        if os.path.isfile(out_file) and os.path.getsize(out_file) > 0:
-            return {"id": shortcode, "title": title}, out_file
-
+        if video_match:
+            video_url = video_match.group(1).replace("&amp;", "&")
+            title_match = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html)
+            title = title_match.group(1) if title_match else f"instagram_reel_{shortcode}"
+            
+            out_file = os.path.join(temp_dir, f"{shortcode}_og.mp4")
+            download_file_from_url(video_url, out_file)
+            if os.path.isfile(out_file) and os.path.getsize(out_file) > 10000:
+                return {"id": shortcode, "title": title}, out_file
     except Exception as exc:
-        raise RuntimeError("Could not extract audio/video track: " + str(exc))
+        last_error = str(exc)
 
-    raise RuntimeError("Failed to download video stream.")
+    raise RuntimeError(f"Instagram blocked direct access. Error: {last_error or 'Unknown'}")
 
 
 @app.route("/", methods=["GET"])
@@ -132,7 +144,7 @@ def download():
     temp_dir = tempfile.mkdtemp(prefix="instagram_download_")
 
     try:
-        info, final_path = download_instagram_og(url, temp_dir)
+        info, final_path = download_instagram(url, temp_dir)
 
         token = uuid.uuid4().hex
         title = info.get("title") or "instagram_reel"
