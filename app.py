@@ -20,11 +20,10 @@ DOWNLOADS_LOCK = threading.Lock()
 
 
 # =========================================================
-# FFMPEG PATH HELPER (WORKS ON RENDER WITHOUT APT.TXT)
+# FFMPEG PATH HELPER
 # =========================================================
 
 def get_ffmpeg_path():
-    # पहले सिस्टम में चेक करें, न मिले तो imageio_ffmpeg से लें
     sys_ffmpeg = shutil.which("ffmpeg")
     if sys_ffmpeg:
         return sys_ffmpeg
@@ -85,7 +84,7 @@ def is_valid_instagram_url(url):
 
 
 # =========================================================
-# MEDIA STREAM CHECK USING FFMPEG (NO FFPROBE NEEDED)
+# MEDIA STREAM CHECK USING FFMPEG
 # =========================================================
 
 def get_media_streams_info(file_path):
@@ -94,9 +93,8 @@ def get_media_streams_info(file_path):
         return ""
 
     try:
-        # ffmpeg -i फाइल की स्ट्रीम जानकारी stderr में देता है
         result = subprocess.run(
-            [ffmpeg, "- hide_banner", "-i", file_path],
+            [ffmpeg, "-hide_banner", "-i", file_path],
             capture_output=True,
             text=True,
             timeout=20,
@@ -216,7 +214,7 @@ def finalize_video(input_file, temp_dir):
 
 
 # =========================================================
-# YT-DLP DOWNLOAD (FIXED FOR AUDIO)
+# YT-DLP DOWNLOAD WITH AUTOMATIC AUDIO MERGE
 # =========================================================
 
 def download_instagram(url, temp_dir):
@@ -226,17 +224,15 @@ def download_instagram(url, temp_dir):
     if not ffmpeg_path:
         raise RuntimeError("FFmpeg binary is not available on server.")
 
-    # बदलाव: सबसे पहले Video+Audio मर्ज करेगा या वही MP4 लेगा जिसमें ऑडियो मौजूद हो
     format_options = [
-        "bv*+ba/best[ext=mp4][acodec!=none][vcodec!=none]/best[acodec!=none]",
-        "bestvideo+bestaudio/best",
-        "best[ext=mp4][acodec!=none]/best"
+        "bestvideo+bestaudio/best[ext=mp4][acodec!=none]/best",
+        "bv*+ba/best[acodec!=none]",
+        "best[ext=mp4]/best"
     ]
 
     last_error = None
 
     for attempt_number, format_selector in enumerate(format_options, start=1):
-        # पुरानी फाइलें साफ करें
         for name in os.listdir(temp_dir):
             path = os.path.join(temp_dir, name)
             try:
@@ -255,6 +251,16 @@ def download_instagram(url, temp_dir):
             "outtmpl": output_template,
             "merge_output_format": "mp4",
             "ffmpeg_location": ffmpeg_path,
+            "postprocessors": [{
+                "key": "FFmpegVideoConvertor",
+                "preferedformat": "mp4",
+            }],
+            "postprocessor_args": [
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-movflags", "+faststart"
+            ],
             "retries": 5,
             "fragment_retries": 5,
             "extractor_retries": 3,
@@ -281,13 +287,13 @@ def download_instagram(url, temp_dir):
             if not files:
                 raise RuntimeError("No downloaded media file was found.")
 
-            # चेक करें कि किस फाइल में ऑडियो और वीडियो दोनों हैं
+            # 1. Check for file that already has both video and audio
             for file_path in sorted(files, key=os.path.getsize, reverse=True):
                 if has_video_stream(file_path) and has_audio_stream(file_path):
                     final_file = finalize_video(file_path, temp_dir)
                     return info, final_file
 
-            # अगर अलग-अलग फाइलें डाउनलोड हुई हैं तो उन्हें मर्ज करें
+            # 2. If separate video and audio files exist, merge them
             video_files = [p for p in files if has_video_stream(p)]
             audio_files = [p for p in files if has_audio_stream(p)]
 
