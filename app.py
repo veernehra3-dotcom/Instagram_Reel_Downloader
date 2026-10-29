@@ -1,15 +1,15 @@
 import os
 import re
+import json
 import uuid
 import shutil
 import tempfile
 import threading
 import subprocess
 from urllib.parse import urlparse, quote
+from urllib.request import Request, urlopen
 
-import requests
 import yt_dlp
-import imageio_ffmpeg
 from flask import Flask, request, jsonify, Response, send_file
 
 app = Flask(__name__)
@@ -25,13 +25,7 @@ DOWNLOADS_LOCK = threading.Lock()
 # =========================================================
 
 def get_ffmpeg_path():
-    sys_ffmpeg = shutil.which("ffmpeg")
-    if sys_ffmpeg:
-        return sys_ffmpeg
-    try:
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:
-        return None
+    return shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 
 
 # =========================================================
@@ -53,7 +47,7 @@ def add_cors_headers(response):
 
 
 # =========================================================
-# INSTAGRAM URL VALIDATION & SHORTCODE EXTRACTOR
+# INSTAGRAM URL VALIDATION & SHORTCODE
 # =========================================================
 
 def is_valid_instagram_url(url):
@@ -106,8 +100,7 @@ def get_media_streams_info(file_path):
             check=False
         )
         return result.stderr or ""
-    except Exception as exc:
-        app.logger.warning("FFmpeg inspect error: %s", str(exc))
+    except Exception:
         return ""
 
 
@@ -122,8 +115,21 @@ def has_video_stream(file_path):
 
 
 # =========================================================
-# DIRECT FILE DOWNLOAD HELPER
+# BUILT-IN HTTP HELPERS (NO 'requests' MODULE NEEDED)
 # =========================================================
+
+def http_get_text(url, headers=None, timeout=20):
+    req_headers = headers or {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
+    req = Request(url, headers=req_headers)
+    with urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="ignore")
+
 
 def download_file_from_url(media_url, output_path):
     headers = {
@@ -133,17 +139,14 @@ def download_file_from_url(media_url, output_path):
         ),
         "Referer": "https://www.instagram.com/"
     }
-    with requests.get(media_url, headers=headers, stream=True, timeout=45) as r:
-        r.raise_for_status()
-        with open(output_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=65536):
-                if chunk:
-                    f.write(chunk)
+    req = Request(media_url, headers=headers)
+    with urlopen(req, timeout=45) as resp, open(output_path, "wb") as out_file:
+        shutil.copyfileobj(resp, out_file)
     return output_path
 
 
 # =========================================================
-# METHOD 1: INSTAGRAM GRAPHQL / EMBED WITH AUDIO
+# METHOD 1: INSTAGRAM GRAPHQL & EMBED (COMBINED AUDIO+VIDEO)
 # =========================================================
 
 def try_graphql_or_embed(url, temp_dir):
@@ -151,53 +154,49 @@ def try_graphql_or_embed(url, temp_dir):
     if not shortcode:
         return None
 
-    headers = {
-        "User-Agent": "Instagram 289.0.0.77.109 Android (33/13; 420dpi; 1080x2400; samsung; SM-G991B; o1s; exynos2100; en_US; 482924614)",
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "X-IG-App-ID": "936619743392459",
-        "Sec-Fetch-Site": "same-origin",
-    }
-
-    # 1A: Instagram GraphQL Endpoint (Returns combined video_url with audio)
+    # 1A: Instagram GraphQL Endpoint
     try:
         graphql_url = (
-            f"https://www.instagram.com/graphql/query/"
-            f"?doc_id=8845758582119845&variables=%7B%22shortcode%22%3A%22{shortcode}%22%7D"
+            "https://www.instagram.com/graphql/query/"
+            "?doc_id=8845758582119845&variables="
+            + quote(json.dumps({"shortcode": shortcode}))
         )
-        resp = requests.get(graphql_url, headers=headers, timeout=20)
-        if resp.status_code == 200:
-            data = resp.json()
-            media = (
-                data.get("data", {}).get("xdt_shortcode_media")
-                or data.get("data", {}).get("shortcode_media")
-                or {}
-            )
-            video_url = media.get("video_url")
-            if video_url:
-                out_file = os.path.join(temp_dir, f"{shortcode}_gql.mp4")
-                download_file_from_url(video_url, out_file)
-                if has_video_stream(out_file) and has_audio_stream(out_file):
-                    return {"id": shortcode, "title": f"reel_{shortcode}"}, out_file
+        gql_headers = {
+            "User-Agent": (
+                "Instagram 289.0.0.77.109 Android "
+                "(33/13; 420dpi; 1080x2400; samsung; SM-G991B; o1s; exynos2100; en_US; 482924614)"
+            ),
+            "Accept": "*/*",
+            "X-IG-App-ID": "936619743392459"
+        }
+        raw_json = http_get_text(graphql_url, headers=gql_headers, timeout=20)
+        data = json.loads(raw_json)
+        media = (
+            data.get("data", {}).get("xdt_shortcode_media")
+            or data.get("data", {}).get("shortcode_media")
+            or {}
+        )
+        video_url = media.get("video_url")
+        if video_url:
+            out_file = os.path.join(temp_dir, shortcode + "_gql.mp4")
+            download_file_from_url(video_url, out_file)
+            if has_video_stream(out_file) and has_audio_stream(out_file):
+                return {"id": shortcode, "title": "reel_" + shortcode}, out_file
     except Exception as exc:
         app.logger.warning("GraphQL fallback failed: %s", str(exc))
 
-    # 1B: Embed Captioned Page (Extracts video_url which always has combined audio)
+    # 1B: Instagram Captioned Embed Page
     try:
-        embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
-        embed_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        }
-        resp = requests.get(embed_url, headers=embed_headers, timeout=20)
-        if resp.status_code == 200:
-            html = resp.text.replace("\\/", "/")
-            matches = re.findall(r'"video_url"\s*:\s*"([^"]+)"', html)
-            for match in matches:
-                clean_url = match.encode("utf-8").decode("unicode_escape")
-                out_file = os.path.join(temp_dir, f"{shortcode}_embed.mp4")
-                download_file_from_url(clean_url, out_file)
-                if has_video_stream(out_file) and has_audio_stream(out_file):
-                    return {"id": shortcode, "title": f"reel_{shortcode}"}, out_file
+        embed_url = "https://www.instagram.com/p/" + shortcode + "/embed/captioned/"
+        html = http_get_text(embed_url, timeout=20)
+        html_clean = html.replace("\\/", "/")
+        matches = re.findall(r'"video_url"\s*:\s*"([^"]+)"', html_clean)
+        for match in matches:
+            clean_url = match.encode("utf-8").decode("unicode_escape")
+            out_file = os.path.join(temp_dir, shortcode + "_embed.mp4")
+            download_file_from_url(clean_url, out_file)
+            if has_video_stream(out_file) and has_audio_stream(out_file):
+                return {"id": shortcode, "title": "reel_" + shortcode}, out_file
     except Exception as exc:
         app.logger.warning("Embed fallback failed: %s", str(exc))
 
@@ -205,28 +204,25 @@ def try_graphql_or_embed(url, temp_dir):
 
 
 # =========================================================
-# METHOD 2: PUBLIC API FALLBACKS (FOR RENDER CLOUD IP)
+# METHOD 2: PUBLIC API FALLBACK
 # =========================================================
 
 def try_public_api_fallbacks(url, temp_dir):
     shortcode = extract_shortcode(url) or "reel"
-
-    # Fallback API 1: VKRDownloader / Public JSON Extractor
     try:
-        api_url = f"https://vkrdownloader.xyz/server?vkr={quote(url)}"
-        resp = requests.get(api_url, timeout=25)
-        if resp.status_code == 200:
-            data = resp.json().get("data", {})
-            downloads = data.get("downloads", [])
-            for item in downloads:
-                dl_url = item.get("url")
-                if dl_url:
-                    out_file = os.path.join(temp_dir, f"{shortcode}_api1.mp4")
-                    download_file_from_url(dl_url, out_file)
-                    if has_video_stream(out_file) and has_audio_stream(out_file):
-                        return {"id": shortcode, "title": data.get("title") or f"reel_{shortcode}"}, out_file
+        api_url = "https://vkrdownloader.xyz/server?vkr=" + quote(url)
+        raw_json = http_get_text(api_url, timeout=25)
+        data = json.loads(raw_json).get("data", {})
+        downloads = data.get("downloads", [])
+        for item in downloads:
+            dl_url = item.get("url")
+            if dl_url:
+                out_file = os.path.join(temp_dir, shortcode + "_api.mp4")
+                download_file_from_url(dl_url, out_file)
+                if has_video_stream(out_file) and has_audio_stream(out_file):
+                    return {"id": shortcode, "title": data.get("title") or ("reel_" + shortcode)}, out_file
     except Exception as exc:
-        app.logger.warning("Public API 1 failed: %s", str(exc))
+        app.logger.warning("Public API fallback failed: %s", str(exc))
 
     return None
 
@@ -237,9 +233,6 @@ def try_public_api_fallbacks(url, temp_dir):
 
 def merge_video_audio(video_file, audio_file, temp_dir):
     ffmpeg = get_ffmpeg_path()
-    if not ffmpeg:
-        raise RuntimeError("FFmpeg is not available.")
-
     output_file = os.path.join(temp_dir, "instagram_merged.mp4")
 
     command = [
@@ -271,9 +264,6 @@ def merge_video_audio(video_file, audio_file, temp_dir):
 
 def finalize_video(input_file, temp_dir):
     ffmpeg = get_ffmpeg_path()
-    if not ffmpeg:
-        return input_file
-
     output_file = os.path.join(temp_dir, "instagram_final.mp4")
 
     command = [
@@ -303,21 +293,19 @@ def finalize_video(input_file, temp_dir):
 
 
 # =========================================================
-# MASTER DOWNLOADER (COMBINES ALL METHODS)
+# MASTER DOWNLOADER
 # =========================================================
 
 def download_instagram(url, temp_dir):
     ffmpeg_path = get_ffmpeg_path()
-    if not ffmpeg_path:
-        raise RuntimeError("FFmpeg binary is not available on server.")
 
-    # STEP 1: पहले GraphQL और Embed तरीका ट्राई करें (इसमें ऑडियो हमेशा जुड़ा होता है)
+    # 1. Try GraphQL or Embed first (Always has Audio)
     gql_result = try_graphql_or_embed(url, temp_dir)
     if gql_result:
         info, file_path = gql_result
         return info, finalize_video(file_path, temp_dir)
 
-    # STEP 2: yt-dlp से सभी फॉर्मेट्स चेक करें और Video + Audio स्ट्रीम अलग-अलग डाउनलोड करके मर्ज करें
+    # 2. Try yt-dlp format extraction & stream merging
     try:
         ydl_info_opts = {
             "quiet": True,
@@ -339,19 +327,19 @@ def download_instagram(url, temp_dir):
             formats = info.get("formats") or []
             shortcode = info.get("id") or extract_shortcode(url) or "reel"
 
-            # A. क्या कोई ऐसा फॉर्मेट है जिसमें ऑडियो और वीडियो दोनों हों?
+            # Check combined formats
             combined_formats = [
                 f for f in formats
                 if f.get("url") and f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")
             ]
             if combined_formats:
                 best_combined = combined_formats[-1]["url"]
-                out_path = os.path.join(temp_dir, f"{shortcode}_combined.mp4")
+                out_path = os.path.join(temp_dir, shortcode + "_combined.mp4")
                 download_file_from_url(best_combined, out_path)
                 if has_video_stream(out_path) and has_audio_stream(out_path):
                     return info, finalize_video(out_path, temp_dir)
 
-            # B. अगर अलग-अलग Video और Audio स्ट्रीम्स हैं, तो दोनों को डाउनलोड करके FFmpeg से जोड़ें
+            # Check separate video and audio formats
             video_formats = [
                 f for f in formats
                 if f.get("url") and f.get("vcodec") not in (None, "none")
@@ -365,8 +353,8 @@ def download_instagram(url, temp_dir):
                 v_url = video_formats[-1]["url"]
                 a_url = audio_formats[-1]["url"]
 
-                v_path = os.path.join(temp_dir, f"{shortcode}_v.mp4")
-                a_path = os.path.join(temp_dir, f"{shortcode}_a.m4a")
+                v_path = os.path.join(temp_dir, shortcode + "_v.mp4")
+                a_path = os.path.join(temp_dir, shortcode + "_a.m4a")
 
                 download_file_from_url(v_url, v_path)
                 download_file_from_url(a_url, a_path)
@@ -376,21 +364,19 @@ def download_instagram(url, temp_dir):
                     return info, merged
 
     except Exception as exc:
-        app.logger.warning("yt-dlp direct extraction failed: %s", str(exc))
+        app.logger.warning("yt-dlp extraction failed: %s", str(exc))
 
-    # STEP 3: अगर Render IP की वजह से Instagram ने ऑडियो छुपा लिया, तो Public API Fallback चलाएं
+    # 3. Try Public API fallback
     api_result = try_public_api_fallbacks(url, temp_dir)
     if api_result:
         info, file_path = api_result
         return info, finalize_video(file_path, temp_dir)
 
-    raise RuntimeError(
-        "Instagram blocked the audio track for this server IP. Please try another Reel."
-    )
+    raise RuntimeError("Could not extract audio track for this Reel.")
 
 
 # =========================================================
-# ROUTES (HOME, HEALTH, DOWNLOAD, FILE)
+# ROUTES
 # =========================================================
 
 @app.route("/", methods=["GET"])
@@ -404,7 +390,7 @@ def home():
     </head>
     <body style="font-family:Arial; text-align:center; padding:40px">
         <h2>Instagram Reel Downloader API</h2>
-        <p>Service is running with Multi-Engine Audio Support.</p>
+        <p>Service is running.</p>
         <p><a href="/health">Check API Health</a></p>
     </body>
     </html>
@@ -413,7 +399,7 @@ def home():
 
 @app.route("/health", methods=["GET"])
 def health():
-    ffmpeg_bin = get_ffmpeg_path()
+    ffmpeg_bin = shutil.which("ffmpeg")
     return jsonify({
         "status": "online",
         "message": "Instagram Downloader API is running",
@@ -443,12 +429,6 @@ def download():
             "success": False,
             "error": "Please enter a valid Instagram Reel URL."
         }), 400
-
-    if not get_ffmpeg_path():
-        return jsonify({
-            "success": False,
-            "error": "FFmpeg is not available on Render."
-        }), 503
 
     temp_dir = tempfile.mkdtemp(prefix="instagram_download_")
 
