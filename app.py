@@ -4,6 +4,7 @@ import uuid
 import shutil
 import tempfile
 import threading
+import subprocess
 from urllib.parse import urlparse
 
 import yt_dlp
@@ -49,47 +50,90 @@ def is_valid_instagram_url(url):
 
 
 # =========================================================
-# YT-DLP MASTER DOWNLOADER (WITH AUDIO MERGING)
+# FFMPEG AUDIO & VIDEO CHECKER
+# =========================================================
+
+def get_media_streams_info(file_path):
+    ffmpeg = get_ffmpeg_path()
+    if not ffmpeg or not os.path.isfile(file_path):
+        return ""
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-i", file_path],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False
+        )
+        return result.stderr or ""
+    except Exception:
+        return ""
+
+
+def has_audio_stream(file_path):
+    return "Audio:" in get_media_streams_info(file_path)
+
+
+def has_video_stream(file_path):
+    return "Video:" in get_media_streams_info(file_path)
+
+
+# =========================================================
+# YT-DLP SMART DOWNLOADER (GUARANTEED AUDIO)
 # =========================================================
 
 def download_instagram(url, temp_dir):
     output_template = os.path.join(temp_dir, "%(id)s.%(ext)s")
     ffmpeg_path = get_ffmpeg_path()
 
-    ydl_opts = {
-        'format': 'bestvideo+bestaudio/best',
-        'outtmpl': output_template,
-        'merge_output_format': 'mp4',
-        'ffmpeg_location': ffmpeg_path,
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-        'socket_timeout': 30,
-        'extractor_args': {
-            'instagram': {
-                'api': ['web', 'graphql']
-            }
-        },
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9',
-        }
-    }
+    # हम दो अलग-अलग फॉर्मेट ऑप्शंस ट्राई करेंगे ताकि ऑडियो मिस न हो
+    format_strategies = [
+        'best[acodec!=none]/best',  # ऐसा फॉर्मेट जिसमें ऑडियो पहले से जुड़ा हो
+        'bestvideo+bestaudio/best'  # अलग से वीडियो और ऑडियो डाउनलोड करके मर्ज करना
+    ]
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            
+    last_error = None
+
+    for format_selector in format_strategies:
+        try:
+            # पुरानी फाइलें साफ करें
+            for f in os.listdir(temp_dir):
+                f_path = os.path.join(temp_dir, f)
+                if os.path.isfile(f_path):
+                    os.remove(f_path)
+
+            ydl_opts = {
+                'format': format_selector,
+                'outtmpl': output_template,
+                'merge_output_format': 'mp4',
+                'ffmpeg_location': ffmpeg_path,
+                'quiet': True,
+                'no_warnings': True,
+                'noplaylist': True,
+                'socket_timeout': 30,
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                }
+            }
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                
+            # डाउनलोड हुई फाइलें चेक करें
             files = [os.path.join(temp_dir, f) for f in os.listdir(temp_dir) if f.endswith('.mp4')]
             if files:
                 best_file = max(files, key=os.path.getsize)
-                if os.path.getsize(best_file) > 10000:
+                
+                # सबसे ज़रूरी चेक: क्या फाइल में सच में ऑडियो है?
+                if os.path.getsize(best_file) > 10000 and has_audio_stream(best_file):
                     return info, best_file
 
-    except Exception as exc:
-        raise RuntimeError(str(exc))
+        except Exception as exc:
+            last_error = str(exc)
+            continue
 
-    raise RuntimeError("Could not download this Reel with audio.")
+    raise RuntimeError(f"Could not download Reel with audio. Error: {last_error or 'No audio track found'}")
 
 
 @app.route("/", methods=["GET"])
